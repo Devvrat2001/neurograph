@@ -1,0 +1,254 @@
+# P1-10 — Windows release pipeline.
+#
+# Builds the NeuroGraph Workbench Release MSI on a clean Windows
+# runner, signs it (when secrets are available), smoke-tests
+# silent install / uninstall, and publishes the .msi as a workflow
+# artifact. On semver tag pushes (v*) it also attaches the MSI to a
+# GitHub Release.
+#
+# The build is a single job because the MSI smoke test has to run on
+# the same runner that produced it (so we don't need to round-trip
+# the artifact through the cache before installing it).
+#
+# CUDA 12.4 is installed via Jimver/cuda-toolkit because the project's
+# CMakeLists declares CUDA as a first-class language (sm_86). The
+# runtime payload doesn't make any CUDA calls itself — the dependency
+# is link-time only via the static neurograph_cuda library — but that
+# still requires nvcc on PATH at build time.
+
+name: release-windows
+
+on:
+  push:
+    tags:
+      - "v*"
+    branches:
+      - main
+    paths:
+      - "packaging/windows/**"
+      - "src/**"
+      - "include/**"
+      - "cuda/**"
+      - "CMakeLists.txt"
+      - "vcpkg.json"
+      - ".github/workflows/release-windows.yml"
+  pull_request:
+    paths:
+      - "packaging/windows/**"
+      - ".github/workflows/release-windows.yml"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Override the MSI ProductVersion (default: derived from tag or 0.0.0-dev)."
+        required: false
+        default: ""
+
+# Cancel superseded runs on the same ref to keep the queue moving.
+concurrency:
+  group: release-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write   # needed by softprops/action-gh-release on tag pushes
+
+jobs:
+  build-msi:
+    name: Build & sign Windows MSI
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    env:
+      # vcpkg manifest mode reads from vcpkg.json. Pinning the cache
+      # key to its hash means dep changes invalidate the cache cleanly.
+      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+      VCPKG_DEFAULT_TRIPLET: x64-windows
+      CMAKE_BUILD_PARALLEL_LEVEL: "4"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # tags + history for git-derived version strings
+
+      - name: Resolve MSI version
+        id: ver
+        shell: pwsh
+        run: |
+          # Priority: workflow_dispatch input > git tag > dev fallback.
+          $v = "${{ github.event.inputs.version }}"
+          if (-not $v) {
+            if ("${{ github.ref_type }}" -eq "tag" -and "${{ github.ref_name }}".StartsWith("v")) {
+              $v = "${{ github.ref_name }}".Substring(1)
+            } else {
+              # WiX rejects pre-release suffixes — strip anything past +/-
+              # for the numeric ProductVersion.
+              $sha = "${{ github.sha }}".Substring(0, 7)
+              $v = "0.0.0"
+              Write-Host "Using dev version $v (sha $sha)"
+            }
+          }
+          # WiX ProductVersion must be n.n.n[.n] with each field <= 65535.
+          if ($v -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') {
+            throw "MSI version '$v' is not in n.n.n[.n] form. Pass workflow_dispatch.inputs.version or push a v<semver> tag."
+          }
+          "msi_version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "MSI version: $v"
+
+      - name: Set up MSBuild (VS 2022)
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install CUDA Toolkit 12.4
+        uses: Jimver/cuda-toolkit@v0.2.16
+        id: cuda
+        with:
+          cuda: "12.4.0"
+          # Slim install: just the bits needed to compile the kernels
+          # (no nsight, no docs, no samples). Saves ~3 GB.
+          sub-packages: '["nvcc", "cudart", "thrust", "visual_studio_integration"]'
+          method: "network"
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          # Pin to a vcpkg revision that ships a known-good imgui +
+          # libsodium combo. Update with care — manifest mode rebuilds
+          # everything when this changes.
+          vcpkgGitCommitId: "f33ad75da8d272e76dd685982f8ad862c6044f8e"
+
+      - name: Configure (CMake + vcpkg manifest)
+        shell: pwsh
+        run: |
+          cmake -S . -B build `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DNEUROGRAPH_BUILD_TESTS=OFF
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
+
+      - name: Build payload targets (Release)
+        shell: pwsh
+        run: |
+          # Only the targets that ship inside the MSI — skip the test
+          # binaries and the legacy `neurograph` CLI.
+          cmake --build build --config Release --parallel `
+            --target neurograph_workbench `
+            --target neurograph_predict `
+            --target neurograph_rt
+          if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
+
+      - name: Install WiX 5 (dotnet global tool)
+        shell: pwsh
+        run: |
+          # Pin to 5.x — WiX 7 requires .NET 8 and breaks the
+          # WixUI_InstallDir extension we depend on.
+          dotnet tool install --global wix --version 5.0.2
+          if ($LASTEXITCODE -ne 0) { throw "wix install failed" }
+          # Tools land in ~/.dotnet/tools which isn't on PATH yet.
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          ./packaging/windows/build_installer.ps1 `
+            -BuildDir "$pwd/build" `
+            -Configuration Release `
+            -Version "${{ steps.ver.outputs.msi_version }}" `
+            -Manufacturer "NeuroGraph Inc."
+
+      - name: Sign MSI
+        shell: pwsh
+        env:
+          NEUROGRAPH_SIGN_CERT_PATH: ${{ secrets.NEUROGRAPH_SIGN_CERT_PATH }}
+          NEUROGRAPH_SIGN_CERT_PASS: ${{ secrets.NEUROGRAPH_SIGN_CERT_PASS }}
+        run: |
+          # sign.ps1 is intentionally a no-op (warning + exit 0) when
+          # the cert env vars are unset, so PRs from forks without
+          # secret access still pass. Production tag builds gate
+          # release on the cert being present (see "Verify signature
+          # on release builds" below).
+          ./packaging/windows/sign.ps1
+
+      - name: Verify signature is present on release tag builds
+        if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem build/installer/NeuroGraph-*.msi |
+                 Sort-Object LastWriteTime -Descending |
+                 Select-Object -First 1
+          if (-not $msi) { throw "No MSI found to verify" }
+          $sig = Get-AuthenticodeSignature $msi.FullName
+          Write-Host "Signature status: $($sig.Status)"
+          if ($sig.Status -ne "Valid") {
+            throw "Release tag build produced an unsigned or invalidly-signed MSI ($($sig.Status)). Check that NEUROGRAPH_SIGN_CERT_* secrets are set."
+          }
+
+      - name: Smoke test silent install / uninstall
+        shell: pwsh
+        run: |
+          $msi = (Get-ChildItem build/installer/NeuroGraph-*.msi |
+                  Sort-Object LastWriteTime -Descending |
+                  Select-Object -First 1).FullName
+          $log = "$env:RUNNER_TEMP/msi-install.log"
+
+          Write-Host "==> Silent install"
+          $p = Start-Process msiexec.exe `
+                 -ArgumentList @("/i", $msi, "/quiet", "/norestart", "/l*v", $log) `
+                 -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
+            Write-Host "Install failed (exit $($p.ExitCode)). Log tail:"
+            Get-Content $log -Tail 80
+            throw "msiexec /i exited $($p.ExitCode)"
+          }
+
+          $installed = "C:\Program Files\NeuroGraph"
+          Write-Host "==> Verify payload at $installed"
+          foreach ($f in @("neurograph_workbench.exe",
+                           "neurograph_predict.exe",
+                           "neurograph_rt.dll",
+                           "spdlog.dll", "fmt.dll", "libsodium.dll")) {
+            $path = Join-Path $installed $f
+            if (-not (Test-Path $path)) { throw "Missing after install: $path" }
+            Write-Host "    OK $f"
+          }
+
+          # ProductCode lookup so /x can target the install we just did
+          # without us having to pin a GUID.
+          $product = Get-WmiObject Win32_Product `
+                       -Filter "Name = 'NeuroGraph'" |
+                     Select-Object -First 1
+          if (-not $product) { throw "NeuroGraph not registered with MSI database" }
+          Write-Host "==> Found ProductCode $($product.IdentifyingNumber)"
+
+          Write-Host "==> Silent uninstall"
+          $logu = "$env:RUNNER_TEMP/msi-uninstall.log"
+          $p = Start-Process msiexec.exe `
+                 -ArgumentList @("/x", $product.IdentifyingNumber, "/quiet", "/norestart", "/l*v", $logu) `
+                 -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
+            Write-Host "Uninstall failed (exit $($p.ExitCode)). Log tail:"
+            Get-Content $logu -Tail 80
+            throw "msiexec /x exited $($p.ExitCode)"
+          }
+          if (Test-Path $installed) {
+            throw "Install dir still present after uninstall: $installed"
+          }
+          Write-Host "==> Smoke test passed"
+
+      - name: Upload MSI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NeuroGraph-${{ steps.ver.outputs.msi_version }}-msi
+          path: |
+            build/installer/NeuroGraph-*.msi
+            build/installer/NeuroGraph-*.wixpdb
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release (tag builds only)
+        if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/installer/NeuroGraph-*.msi
+          generate_release_notes: true
+          fail_on_unmatched_files: true

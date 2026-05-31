@@ -1,0 +1,933 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NeuroGraph Workbench</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+:root {
+    --bg: #0a0e17; --bg2: #111827; --bg3: #1a2235; --bg4: #243049;
+    --fg: #e2e8f0; --fg2: #94a3b8; --fg3: #64748b;
+    --accent: #3b82f6; --accent2: #60a5fa;
+    --green: #22c55e; --red: #ef4444; --yellow: #eab308; --purple: #a855f7;
+    --orange: #f97316; --cyan: #06b6d4;
+    --border: #1e293b; --radius: 8px;
+}
+body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--fg); height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
+
+/* Top Bar */
+.topbar { display:flex; align-items:center; justify-content:space-between; background: var(--bg2); border-bottom: 1px solid var(--border); padding: 0 16px; height: 48px; flex-shrink:0; }
+.topbar-left { display:flex; align-items:center; gap:12px; }
+.topbar-left h1 { font-size:16px; font-weight:700; background: linear-gradient(135deg, var(--accent2), var(--cyan)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
+.conn-badge { padding: 3px 10px; border-radius:12px; font-size:11px; font-weight:600; }
+.conn-badge.connected { background: rgba(34,197,94,0.15); color: var(--green); }
+.conn-badge.disconnected { background: rgba(239,68,68,0.15); color: var(--red); }
+.topbar-center { display:flex; gap:4px; }
+.topbar-center button { background: transparent; border:1px solid var(--border); color: var(--fg2); padding: 5px 14px; border-radius: 6px; cursor:pointer; font-size:12px; transition:0.2s; }
+.topbar-center button.active { background: var(--accent); border-color: var(--accent); color:#fff; }
+.topbar-center button:hover:not(.active) { background: var(--bg3); }
+.topbar-right { display:flex; align-items:center; gap:8px; }
+.stat-chip { background: var(--bg3); padding:3px 10px; border-radius:6px; font-size:11px; color: var(--fg2); }
+.stat-chip span { color: var(--fg); font-weight:600; }
+
+/* Main Layout */
+.main { display:flex; flex:1; overflow:hidden; }
+
+/* Left Panel - File Manager */
+.panel-left { width:280px; background:var(--bg2); border-right:1px solid var(--border); display:flex; flex-direction:column; flex-shrink:0; }
+.panel-section { padding:12px; border-bottom:1px solid var(--border); }
+.panel-section h3 { font-size:11px; text-transform:uppercase; letter-spacing:1px; color:var(--fg3); margin-bottom:8px; display:flex; align-items:center; justify-content:space-between; }
+.panel-section h3 .count { color: var(--accent2); }
+.btn { display:inline-flex; align-items:center; gap:6px; padding:6px 12px; border-radius:var(--radius); border:1px solid var(--border); background:var(--bg3); color:var(--fg); cursor:pointer; font-size:12px; transition:0.2s; }
+.btn:hover { background:var(--bg4); }
+.btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+.btn.primary:hover { background:#2563eb; }
+.btn.danger { background:transparent; border-color:var(--red); color:var(--red); }
+.btn.danger:hover { background:rgba(239,68,68,0.1); }
+.btn.sm { padding:4px 8px; font-size:11px; }
+.btn-row { display:flex; gap:6px; flex-wrap:wrap; }
+
+/* File list */
+.file-list { flex:1; overflow-y:auto; padding:4px; }
+.file-item { padding:10px 12px; border-radius:var(--radius); cursor:pointer; margin-bottom:2px; border:1px solid transparent; transition:0.15s; }
+.file-item:hover { background:var(--bg3); }
+.file-item.active { background:var(--bg3); border-color:var(--accent); }
+.file-item.loaded { border-left:3px solid var(--green); }
+.file-name { font-size:13px; font-weight:600; margin-bottom:2px; display:flex; align-items:center; gap:6px; }
+.file-name .badge { font-size:9px; padding:1px 5px; border-radius:4px; font-weight:700; }
+.file-name .badge.loaded { background:rgba(34,197,94,0.15); color:var(--green); }
+.file-meta { font-size:11px; color:var(--fg3); }
+.file-tags { display:flex; gap:3px; margin-top:4px; flex-wrap:wrap; }
+.file-tags .tag { font-size:9px; padding:1px 5px; background:var(--bg4); border-radius:3px; color:var(--fg2); }
+
+/* Canvas Area */
+.canvas-area { flex:1; position:relative; background:var(--bg); overflow:hidden; }
+#networkCanvas { width:100%; height:100%; display:block; }
+.canvas-overlay { position:absolute; top:12px; left:12px; display:flex; flex-direction:column; gap:6px; }
+.canvas-overlay .mini-stat { background:rgba(17,24,39,0.85); border:1px solid var(--border); padding:6px 10px; border-radius:6px; font-size:11px; backdrop-filter:blur(8px); }
+.canvas-overlay .mini-stat label { color:var(--fg3); display:block; font-size:9px; text-transform:uppercase; letter-spacing:0.5px; }
+.canvas-overlay .mini-stat .val { font-size:16px; font-weight:700; }
+.no-connection-overlay { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; background:rgba(10,14,23,0.92); z-index:10; flex-direction:column; gap:12px; }
+.no-connection-overlay h2 { font-size:20px; color:var(--fg); }
+.no-connection-overlay p { color:var(--fg3); font-size:13px; max-width:400px; text-align:center; }
+.no-connection-overlay .pulse { width:16px; height:16px; background:var(--red); border-radius:50%; animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.4;transform:scale(1.2)} }
+
+/* Right Panel - Controls & Inspector */
+.panel-right { width:300px; background:var(--bg2); border-left:1px solid var(--border); display:flex; flex-direction:column; flex-shrink:0; overflow-y:auto; }
+.control-group { padding:12px; border-bottom:1px solid var(--border); }
+.control-group h3 { font-size:11px; text-transform:uppercase; letter-spacing:1px; color:var(--fg3); margin-bottom:10px; }
+.control-row { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
+.control-row label { font-size:12px; color:var(--fg2); }
+.control-row .val { font-size:12px; color:var(--accent2); font-weight:600; min-width:40px; text-align:right; }
+input[type=range] { width:100%; accent-color:var(--accent); height:4px; margin-top:4px; }
+input[type=text], input[type=number], select, textarea { width:100%; padding:6px 10px; background:var(--bg); border:1px solid var(--border); border-radius:var(--radius); color:var(--fg); font-size:12px; outline:none; }
+input:focus, select:focus, textarea:focus { border-color:var(--accent); }
+textarea { resize:vertical; min-height:60px; font-family:inherit; }
+.form-row { margin-bottom:10px; }
+.form-row label { display:block; font-size:11px; color:var(--fg3); margin-bottom:4px; text-transform:uppercase; letter-spacing:0.5px; }
+
+/* Inspector */
+.inspector-empty { padding:24px; text-align:center; color:var(--fg3); font-size:12px; }
+.inspector-card { padding:10px; background:var(--bg3); border-radius:var(--radius); margin-bottom:8px; }
+.inspector-card h4 { font-size:11px; color:var(--fg3); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:6px; }
+.inspector-row { display:flex; justify-content:space-between; font-size:12px; padding:2px 0; }
+.inspector-row .k { color:var(--fg2); }
+.inspector-row .v { color:var(--fg); font-weight:600; }
+.history-chart { width:100%; height:40px; background:var(--bg); border-radius:4px; margin-top:6px; }
+
+/* Modal */
+.modal-backdrop { position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:100; display:flex; align-items:center; justify-content:center; backdrop-filter:blur(4px); }
+.modal { background:var(--bg2); border:1px solid var(--border); border-radius:12px; width:480px; max-height:80vh; overflow-y:auto; box-shadow:0 20px 60px rgba(0,0,0,0.5); }
+.modal-header { padding:16px 20px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; }
+.modal-header h2 { font-size:16px; }
+.modal-header .close-btn { background:none; border:none; color:var(--fg3); font-size:20px; cursor:pointer; }
+.modal-body { padding:20px; }
+.modal-footer { padding:12px 20px; border-top:1px solid var(--border); display:flex; justify-content:flex-end; gap:8px; }
+
+/* Event Log */
+.event-log { max-height:200px; overflow-y:auto; }
+.event-item { padding:6px 0; border-bottom:1px solid var(--border); font-size:11px; display:flex; gap:8px; }
+.event-item .time { color:var(--fg3); min-width:60px; }
+.event-item .type { font-weight:600; min-width:100px; }
+.event-item .type.create { color:var(--green); }
+.event-item .type.prune { color:var(--red); }
+.event-item .type.epoch { color:var(--accent2); }
+.event-item .type.save { color:var(--yellow); }
+.event-item .type.load { color:var(--cyan); }
+.event-item .msg { color:var(--fg2); }
+
+/* Scrollbar */
+::-webkit-scrollbar { width:6px; }
+::-webkit-scrollbar-track { background:transparent; }
+::-webkit-scrollbar-thumb { background:var(--bg4); border-radius:3px; }
+::-webkit-scrollbar-thumb:hover { background:var(--fg3); }
+
+/* Training progress */
+.train-progress { height:4px; background:var(--bg); border-radius:2px; overflow:hidden; margin-top:6px; }
+.train-progress .bar { height:100%; background: linear-gradient(90deg, var(--accent), var(--cyan)); transition: width 0.3s; }
+</style>
+</head>
+<body>
+
+<!-- Top Bar -->
+<div class="topbar">
+    <div class="topbar-left">
+        <h1>NeuroGraph Workbench</h1>
+        <div id="connBadge" class="conn-badge disconnected">DISCONNECTED</div>
+    </div>
+    <div class="topbar-center">
+        <button class="active" onclick="setView('3d')">3D Network</button>
+        <button onclick="setView('stats')">Statistics</button>
+    </div>
+    <div class="topbar-right">
+        <div class="stat-chip">Neurons: <span id="statNeurons">0</span></div>
+        <div class="stat-chip">Synapses: <span id="statSynapses">0</span></div>
+        <div class="stat-chip">Cycle: <span id="statCycle">0</span></div>
+    </div>
+</div>
+
+<!-- Main Layout -->
+<div class="main">
+    <!-- Left Panel: File Manager -->
+    <div class="panel-left">
+        <div class="panel-section">
+            <h3>Actions</h3>
+            <div class="btn-row">
+                <button class="btn primary" onclick="showCreateModal()">+ New Network</button>
+                <button class="btn" onclick="refreshRegistry()">Refresh</button>
+            </div>
+        </div>
+
+        <div class="panel-section">
+            <h3>Neural Images <span class="count" id="fileCount">0</span></h3>
+        </div>
+
+        <div class="file-list" id="fileList">
+            <div class="inspector-empty">No neural images found.<br>Create one or connect to backend.</div>
+        </div>
+    </div>
+
+    <!-- Canvas Area -->
+    <div class="canvas-area">
+        <canvas id="networkCanvas"></canvas>
+
+        <div class="canvas-overlay" id="canvasOverlay">
+            <div class="mini-stat">
+                <label>Avg Activation</label>
+                <div class="val" id="overlayActivation" style="color:var(--green)">0.000</div>
+            </div>
+            <div class="mini-stat">
+                <label>Avg Weight</label>
+                <div class="val" id="overlayWeight" style="color:var(--accent2)">0.000</div>
+            </div>
+        </div>
+
+        <!-- No connection overlay -->
+        <div class="no-connection-overlay" id="noConnOverlay">
+            <div class="pulse"></div>
+            <h2>Waiting for NeuroGraph Backend</h2>
+            <p>Start <code>neurograph.exe</code> to connect. The workbench requires the C++ backend — there is no simulation mode.</p>
+            <button class="btn primary" onclick="connectWebSocket()">Retry Connection</button>
+        </div>
+    </div>
+
+    <!-- Right Panel -->
+    <div class="panel-right">
+        <!-- Training Controls -->
+        <div class="control-group">
+            <h3>Training</h3>
+            <div class="btn-row" style="margin-bottom:10px">
+                <button class="btn primary" id="btnTrain" onclick="toggleTraining()">Start Training</button>
+                <button class="btn" onclick="stepOnce()">Step</button>
+            </div>
+            <div class="control-row">
+                <label>Learning Rate</label>
+                <span class="val" id="lrVal">0.010</span>
+            </div>
+            <input type="range" id="lrSlider" min="0.001" max="0.1" step="0.001" value="0.01"
+                   oninput="setParam('learning_rate', this.value); document.getElementById('lrVal').textContent=parseFloat(this.value).toFixed(3)">
+
+            <div class="control-row">
+                <label>Stream Interval (ms)</label>
+                <span class="val" id="intervalVal">100</span>
+            </div>
+            <input type="range" id="intervalSlider" min="50" max="1000" step="50" value="100"
+                   oninput="document.getElementById('intervalVal').textContent=this.value">
+
+            <div class="control-row">
+                <label>Pruning Threshold</label>
+                <span class="val" id="pruneVal">0.10</span>
+            </div>
+            <input type="range" id="pruneSlider" min="0.01" max="0.5" step="0.01" value="0.1"
+                   oninput="setParam('pruning_threshold', this.value); document.getElementById('pruneVal').textContent=parseFloat(this.value).toFixed(2)">
+
+            <div class="control-row">
+                <label>Affinity Threshold</label>
+                <span class="val" id="affinityVal">0.25</span>
+            </div>
+            <input type="range" id="affinitySlider" min="0.05" max="1.0" step="0.05" value="0.25"
+                   oninput="setParam('affinity_threshold', this.value); document.getElementById('affinityVal').textContent=parseFloat(this.value).toFixed(2)">
+        </div>
+
+        <!-- Save Controls -->
+        <div class="control-group">
+            <h3>Save Network</h3>
+            <div class="form-row">
+                <label>Name</label>
+                <input type="text" id="saveName" placeholder="my_network_v1">
+            </div>
+            <div class="form-row">
+                <label>Description</label>
+                <textarea id="saveDesc" placeholder="Describe this network..."></textarea>
+            </div>
+            <div class="form-row">
+                <label>Task Type</label>
+                <select id="saveTaskType">
+                    <option value="classification">Classification</option>
+                    <option value="regression">Regression</option>
+                    <option value="clustering">Clustering</option>
+                    <option value="association">Association</option>
+                    <option value="anomaly">Anomaly Detection</option>
+                    <option value="custom">Custom</option>
+                </select>
+            </div>
+            <div class="form-row">
+                <label>Tags (comma separated)</label>
+                <input type="text" id="saveTags" placeholder="trained, v1, demo">
+            </div>
+            <div class="btn-row">
+                <button class="btn primary" onclick="saveNetwork()">Save as New</button>
+                <button class="btn" onclick="overwriteNetwork()">Overwrite Current</button>
+            </div>
+        </div>
+
+        <!-- Neuron Inspector -->
+        <div class="control-group">
+            <h3>Inspector</h3>
+            <div id="inspectorContent">
+                <div class="inspector-empty">Click a neuron in the canvas to inspect it.</div>
+            </div>
+        </div>
+
+        <!-- Event Log -->
+        <div class="control-group">
+            <h3>Event Log</h3>
+            <div class="event-log" id="eventLog">
+                <div class="inspector-empty">No events yet.</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Create Network Modal -->
+<div class="modal-backdrop" id="createModal" style="display:none">
+    <div class="modal">
+        <div class="modal-header">
+            <h2>Create New Network</h2>
+            <button class="close-btn" onclick="hideCreateModal()">&times;</button>
+        </div>
+        <div class="modal-body">
+            <div class="form-row">
+                <label>Network Name</label>
+                <input type="text" id="newName" placeholder="my_new_network">
+            </div>
+            <div class="form-row">
+                <label>Number of Neurons</label>
+                <input type="number" id="newNeurons" value="50" min="2" max="10000">
+            </div>
+            <div class="form-row">
+                <label>Initial Connections</label>
+                <input type="number" id="newConnections" value="100" min="0" max="50000">
+            </div>
+            <div class="form-row">
+                <label>Task Type</label>
+                <select id="newTaskType">
+                    <option value="classification">Classification</option>
+                    <option value="regression">Regression</option>
+                    <option value="clustering">Clustering</option>
+                    <option value="association">Association</option>
+                    <option value="anomaly">Anomaly Detection</option>
+                    <option value="custom">Custom</option>
+                </select>
+            </div>
+            <div class="form-row">
+                <label>Description</label>
+                <textarea id="newDesc" placeholder="Describe the purpose of this network..."></textarea>
+            </div>
+            <div class="form-row">
+                <label>Learning Rate</label>
+                <input type="number" id="newLR" value="0.01" min="0.001" max="1" step="0.001">
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button class="btn" onclick="hideCreateModal()">Cancel</button>
+            <button class="btn primary" onclick="createNetwork()">Create & Load</button>
+        </div>
+    </div>
+</div>
+
+<!-- Rename / Save-As Modal -->
+<div class="modal-backdrop" id="renameModal" style="display:none">
+    <div class="modal">
+        <div class="modal-header">
+            <h2 id="renameTitle">Save As</h2>
+            <button class="close-btn" onclick="hideRenameModal()">&times;</button>
+        </div>
+        <div class="modal-body">
+            <div class="form-row">
+                <label>New File Name</label>
+                <input type="text" id="renameName" placeholder="network_name">
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button class="btn" onclick="hideRenameModal()">Cancel</button>
+            <button class="btn primary" onclick="confirmRename()">Save</button>
+        </div>
+    </div>
+</div>
+
+<!-- Delete Confirmation Modal -->
+<div class="modal-backdrop" id="deleteModal" style="display:none">
+    <div class="modal">
+        <div class="modal-header">
+            <h2>Delete Neural Image</h2>
+            <button class="close-btn" onclick="hideDeleteModal()">&times;</button>
+        </div>
+        <div class="modal-body">
+            <p style="color:var(--fg2);font-size:13px">Are you sure you want to permanently delete <strong id="deleteTargetName"></strong>? This cannot be undone.</p>
+        </div>
+        <div class="modal-footer">
+            <button class="btn" onclick="hideDeleteModal()">Cancel</button>
+            <button class="btn danger" onclick="confirmDelete()">Delete</button>
+        </div>
+    </div>
+</div>
+
+<script>
+// ============================================================
+// STATE
+// ============================================================
+let ws = null;
+let connected = false;
+let neurons = [];
+let synapses = [];
+let networkStats = {};
+let registryImages = [];
+let selectedNeuronId = null;
+let loadedImageName = null;
+let isTraining = false;
+let events = [];
+let deleteTarget = null;
+let currentView = '3d';
+
+// 3D camera state
+let rotX = 0.4, rotY = 0.6, zoom = 1.0;
+let dragStart = null;
+let canvasW = 0, canvasH = 0;
+
+// ============================================================
+// WEBSOCKET
+// ============================================================
+let reconnectTimer = null;
+function scheduleReconnect() {
+    if (reconnectTimer) return; // already scheduled
+    reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connectWebSocket();
+    }, 5000);
+}
+
+function connectWebSocket() {
+    if (ws && ws.readyState <= 1) return;
+    try {
+        ws = new WebSocket('ws://localhost:8765');
+        ws.onopen = () => {
+            connected = true;
+            updateConnBadge();
+            document.getElementById('noConnOverlay').style.display = 'none';
+            addEvent('system', 'Connected to NeuroGraph backend');
+            // Don't send get_state/get_registry here — wait for the
+            // 'welcome' message from backend, then request data.
+            // This ensures the connection is fully stable before large transfers.
+        };
+        ws.onmessage = (e) => handleMessage(JSON.parse(e.data));
+        ws.onclose = (ev) => {
+            connected = false;
+            updateConnBadge();
+            document.getElementById('noConnOverlay').style.display = 'flex';
+            addEvent('system', `Disconnected (code=${ev.code}, clean=${ev.wasClean})`);
+            // Back off reconnect to avoid hammering the server
+            scheduleReconnect();
+        };
+        ws.onerror = (ev) => {
+            console.error('WebSocket error:', ev);
+        };
+    } catch(e) {
+        scheduleReconnect();
+    }
+}
+
+function sendCommand(action, params = {}) {
+    if (!ws || ws.readyState !== 1) return;
+    ws.send(JSON.stringify({ type: 'command', action, ...params }));
+}
+
+function handleMessage(msg) {
+    if (msg.type === 'welcome') {
+        addEvent('system', `Backend ready: ${msg.neuron_count} neurons, ${msg.synapse_count} synapses`);
+        // Now that connection is stable, request data
+        setTimeout(() => sendCommand('get_state'), 100);
+        setTimeout(() => sendCommand('get_registry'), 300);
+    }
+    else if (msg.type === 'state') applyState(msg);
+    else if (msg.type === 'event') handleEvent(msg);
+    else if (msg.type === 'registry') handleRegistry(msg);
+    else if (msg.type === 'response') handleResponse(msg);
+}
+
+// ============================================================
+// STATE UPDATES
+// ============================================================
+function applyState(msg) {
+    const isCompact = msg.compact || false;
+    const rawNeurons = msg.neurons || [];
+    const rawSynapses = msg.synapses || [];
+
+    // Normalize compact format to full format
+    if (isCompact) {
+        neurons = rawNeurons.map(n => ({
+            id: n.id, label: n.l || '', activation: n.a || 0, threshold: n.t || 0,
+            state: n.s === 0 ? 'idle' : n.s === 1 ? 'active' : 'dormant',
+            x: n.x || 0, y: n.y || 0, z: n.z || 0,
+            incoming: n.in || 0, outgoing: n.out || 0,
+            type: n.tp === 'i' ? 'input' : n.tp === 'o' ? 'output' : 'hidden',
+            history: []
+        }));
+        synapses = rawSynapses.map(s => ({
+            source: s.src, target: s.tgt, weight: s.w || 0,
+            type: s.tp === 'e' ? 'excitatory' : 'inhibitory'
+        }));
+    } else {
+        neurons = rawNeurons;
+        synapses = rawSynapses;
+    }
+    networkStats = msg.stats || {};
+
+    document.getElementById('statNeurons').textContent = networkStats.neuron_count || 0;
+    document.getElementById('statSynapses').textContent = networkStats.synapse_count || 0;
+    document.getElementById('statCycle').textContent = networkStats.organization_cycle || 0;
+    document.getElementById('overlayActivation').textContent = (networkStats.avg_activation || 0).toFixed(4);
+    document.getElementById('overlayWeight').textContent = (networkStats.avg_weight || 0).toFixed(4);
+
+    render();
+
+    if (selectedNeuronId) {
+        const n = neurons.find(n => n.id === selectedNeuronId);
+        if (n) updateInspector(n);
+    }
+}
+
+function handleEvent(msg) {
+    const evtType = msg.event || 'unknown';
+    const data = msg.data || {};
+
+    let evtClass = 'epoch';
+    if (evtType.includes('create') || evtType.includes('replicate')) evtClass = 'create';
+    else if (evtType.includes('prune') || evtType.includes('remove')) evtClass = 'prune';
+    else if (evtType.includes('save')) evtClass = 'save';
+    else if (evtType.includes('load')) evtClass = 'load';
+
+    let detail = '';
+    if (data.cycle !== undefined) detail = `cycle ${data.cycle}`;
+    if (data.name) detail = data.name;
+    if (data.neuron_id) detail = `neuron ${data.neuron_id.substring(0,8)}`;
+
+    addEvent(evtClass, `${evtType}${detail ? ': ' + detail : ''}`);
+
+    // Refresh registry after save/load/delete
+    if (evtType.includes('save') || evtType.includes('delete')) {
+        sendCommand('get_registry');
+    }
+    // Refresh state after load
+    if (evtType.includes('load')) {
+        sendCommand('get_state');
+    }
+}
+
+function handleRegistry(msg) {
+    registryImages = msg.images || [];
+    renderFileList();
+}
+
+function handleResponse(msg) {
+    if (msg.status === 'error') {
+        addEvent('prune', `Error: ${msg.message}`);
+    } else if (msg.status === 'ok') {
+        addEvent('save', msg.message || 'OK');
+    }
+}
+
+// ============================================================
+// FILE LIST
+// ============================================================
+function renderFileList() {
+    const container = document.getElementById('fileList');
+    document.getElementById('fileCount').textContent = registryImages.length;
+
+    if (registryImages.length === 0) {
+        container.innerHTML = '<div class="inspector-empty">No neural images found.<br>Create one to get started.</div>';
+        return;
+    }
+
+    container.innerHTML = registryImages.map(img => {
+        const isLoaded = img.name === loadedImageName;
+        const tags = (img.tags || []).map(t => `<span class="tag">${t}</span>`).join('');
+        const acc = img.accuracy ? (img.accuracy * 100).toFixed(1) + '%' : 'N/A';
+        const size = img.file_size ? formatBytes(img.file_size) : '';
+
+        return `
+        <div class="file-item ${isLoaded ? 'loaded active' : ''}" onclick="selectFile('${img.name}')" ondblclick="loadImage('${img.name}')">
+            <div class="file-name">
+                ${img.name}
+                ${isLoaded ? '<span class="badge loaded">LOADED</span>' : ''}
+            </div>
+            <div class="file-meta">
+                ${img.task_type || 'custom'} | ${img.neuron_count || '?'}n / ${img.synapse_count || '?'}s | acc: ${acc} ${size ? '| ' + size : ''}
+            </div>
+            ${tags ? '<div class="file-tags">' + tags + '</div>' : ''}
+            <div class="btn-row" style="margin-top:6px">
+                <button class="btn sm" onclick="event.stopPropagation(); loadImage('${img.name}')">Load</button>
+                <button class="btn sm danger" onclick="event.stopPropagation(); showDeleteModal('${img.name}')">Delete</button>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+function selectFile(name) {
+    document.querySelectorAll('.file-item').forEach(el => el.classList.remove('active'));
+    event.currentTarget?.classList.add('active');
+}
+
+function loadImage(name) {
+    sendCommand('load_image', { name });
+    loadedImageName = name;
+    addEvent('load', `Loading: ${name}`);
+    // State will be refreshed by the backend event
+    setTimeout(() => {
+        sendCommand('get_state');
+        sendCommand('get_registry');
+    }, 200);
+}
+
+function formatBytes(b) {
+    if (b < 1024) return b + 'B';
+    if (b < 1048576) return (b / 1024).toFixed(1) + 'KB';
+    return (b / 1048576).toFixed(1) + 'MB';
+}
+
+// ============================================================
+// NETWORK ACTIONS
+// ============================================================
+function createNetwork() {
+    const name = document.getElementById('newName').value.trim() || 'untitled';
+    const numNeurons = parseInt(document.getElementById('newNeurons').value) || 50;
+    const numConnections = parseInt(document.getElementById('newConnections').value) || 100;
+    const taskType = document.getElementById('newTaskType').value;
+    const desc = document.getElementById('newDesc').value.trim();
+    const lr = parseFloat(document.getElementById('newLR').value) || 0.01;
+
+    sendCommand('create_network', { name, num_neurons: numNeurons, num_connections: numConnections, task_type: taskType, description: desc, learning_rate: lr });
+
+    loadedImageName = name;
+    addEvent('create', `Creating: ${name} (${numNeurons}n, ${numConnections}s)`);
+    hideCreateModal();
+
+    setTimeout(() => {
+        sendCommand('get_state');
+        sendCommand('get_registry');
+    }, 500);
+}
+
+function saveNetwork() {
+    const name = document.getElementById('saveName').value.trim();
+    if (!name) { alert('Enter a name for the network.'); return; }
+    const desc = document.getElementById('saveDesc').value.trim();
+    const taskType = document.getElementById('saveTaskType').value;
+    const tags = document.getElementById('saveTags').value.split(',').map(t => t.trim()).filter(Boolean);
+
+    sendCommand('save_image', { name, description: desc, task_type: taskType, tags });
+    loadedImageName = name;
+    addEvent('save', `Saving: ${name}`);
+    setTimeout(() => sendCommand('get_registry'), 300);
+}
+
+function overwriteNetwork() {
+    if (!loadedImageName) { alert('No network is currently loaded. Use "Save as New" instead.'); return; }
+    const desc = document.getElementById('saveDesc').value.trim();
+    const taskType = document.getElementById('saveTaskType').value;
+    const tags = document.getElementById('saveTags').value.split(',').map(t => t.trim()).filter(Boolean);
+
+    sendCommand('save_image', { name: loadedImageName, description: desc, task_type: taskType, tags, overwrite: true });
+    addEvent('save', `Overwriting: ${loadedImageName}`);
+    setTimeout(() => sendCommand('get_registry'), 300);
+}
+
+function refreshRegistry() {
+    sendCommand('get_registry');
+}
+
+// ============================================================
+// TRAINING
+// ============================================================
+function toggleTraining() {
+    isTraining = !isTraining;
+    const btn = document.getElementById('btnTrain');
+    if (isTraining) {
+        const interval = parseInt(document.getElementById('intervalSlider').value);
+        sendCommand('start_stream', { interval });
+        btn.textContent = 'Stop Training';
+        btn.classList.add('danger');
+        btn.classList.remove('primary');
+    } else {
+        sendCommand('stop_stream');
+        btn.textContent = 'Start Training';
+        btn.classList.remove('danger');
+        btn.classList.add('primary');
+    }
+}
+
+function stepOnce() {
+    sendCommand('step');
+}
+
+function setParam(param, value) {
+    sendCommand('set_param', { param, value: parseFloat(value) });
+}
+
+// ============================================================
+// DELETE
+// ============================================================
+function showDeleteModal(name) {
+    deleteTarget = name;
+    document.getElementById('deleteTargetName').textContent = name;
+    document.getElementById('deleteModal').style.display = 'flex';
+}
+
+function hideDeleteModal() {
+    document.getElementById('deleteModal').style.display = 'none';
+    deleteTarget = null;
+}
+
+function confirmDelete() {
+    if (deleteTarget) {
+        sendCommand('delete_image', { name: deleteTarget });
+        if (deleteTarget === loadedImageName) loadedImageName = null;
+        addEvent('prune', `Deleted: ${deleteTarget}`);
+        setTimeout(() => sendCommand('get_registry'), 300);
+    }
+    hideDeleteModal();
+}
+
+// ============================================================
+// MODALS
+// ============================================================
+function showCreateModal() { document.getElementById('createModal').style.display = 'flex'; }
+function hideCreateModal() { document.getElementById('createModal').style.display = 'none'; }
+function showRenameModal() { document.getElementById('renameModal').style.display = 'flex'; }
+function hideRenameModal() { document.getElementById('renameModal').style.display = 'none'; }
+
+// ============================================================
+// INSPECTOR
+// ============================================================
+function updateInspector(n) {
+    const html = `
+    <div class="inspector-card">
+        <h4>Neuron Properties</h4>
+        <div class="inspector-row"><span class="k">ID</span><span class="v">${n.id.substring(0,12)}...</span></div>
+        <div class="inspector-row"><span class="k">Label</span><span class="v">${n.label || 'unnamed'}</span></div>
+        <div class="inspector-row"><span class="k">Type</span><span class="v" style="color:${n.type === 'input' ? 'var(--cyan)' : n.type === 'output' ? 'var(--orange)' : 'var(--green)'}">${n.type}</span></div>
+        <div class="inspector-row"><span class="k">State</span><span class="v">${n.state}</span></div>
+        <div class="inspector-row"><span class="k">Activation</span><span class="v">${n.activation.toFixed(4)}</span></div>
+        <div class="inspector-row"><span class="k">Threshold</span><span class="v">${n.threshold.toFixed(4)}</span></div>
+        <div class="inspector-row"><span class="k">Incoming</span><span class="v">${n.incoming}</span></div>
+        <div class="inspector-row"><span class="k">Outgoing</span><span class="v">${n.outgoing}</span></div>
+    </div>
+    <div class="inspector-card">
+        <h4>Activation History</h4>
+        <canvas id="historyCanvas" class="history-chart" width="260" height="40"></canvas>
+    </div>`;
+    document.getElementById('inspectorContent').innerHTML = html;
+
+    // Draw history
+    const hist = n.history || [];
+    if (hist.length > 1) {
+        const c = document.getElementById('historyCanvas');
+        const ctx = c.getContext('2d');
+        ctx.clearRect(0,0,c.width,c.height);
+        const max = Math.max(...hist, 0.01);
+        ctx.strokeStyle = '#3b82f6';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        for (let i = 0; i < hist.length; i++) {
+            const x = (i / (hist.length - 1)) * c.width;
+            const y = c.height - (hist[i] / max) * c.height * 0.9;
+            i === 0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
+        }
+        ctx.stroke();
+    }
+}
+
+// ============================================================
+// EVENT LOG
+// ============================================================
+function addEvent(type, msg) {
+    const time = new Date().toLocaleTimeString('en-US', {hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    events.unshift({ time, type, msg });
+    if (events.length > 100) events.pop();
+    renderEventLog();
+}
+
+function renderEventLog() {
+    const container = document.getElementById('eventLog');
+    container.innerHTML = events.slice(0, 30).map(e =>
+        `<div class="event-item"><span class="time">${e.time}</span><span class="type ${e.type}">${e.type}</span><span class="msg">${e.msg}</span></div>`
+    ).join('');
+}
+
+// ============================================================
+// CONNECTION BADGE
+// ============================================================
+function updateConnBadge() {
+    const badge = document.getElementById('connBadge');
+    badge.textContent = connected ? 'CONNECTED' : 'DISCONNECTED';
+    badge.className = 'conn-badge ' + (connected ? 'connected' : 'disconnected');
+}
+
+// ============================================================
+// VIEW
+// ============================================================
+function setView(v) {
+    currentView = v;
+    document.querySelectorAll('.topbar-center button').forEach(b => b.classList.remove('active'));
+    event.target.classList.add('active');
+    render();
+}
+
+// ============================================================
+// 3D RENDERING
+// ============================================================
+const canvas = document.getElementById('networkCanvas');
+const ctx = canvas.getContext('2d');
+
+function resizeCanvas() {
+    const area = canvas.parentElement;
+    canvasW = area.clientWidth;
+    canvasH = area.clientHeight;
+    canvas.width = canvasW * devicePixelRatio;
+    canvas.height = canvasH * devicePixelRatio;
+    ctx.scale(devicePixelRatio, devicePixelRatio);
+    render();
+}
+
+function project3D(x, y, z) {
+    // Rotate
+    const cosA = Math.cos(rotY), sinA = Math.sin(rotY);
+    const cosB = Math.cos(rotX), sinB = Math.sin(rotX);
+    let x1 = x * cosA - z * sinA;
+    let z1 = x * sinA + z * cosA;
+    let y1 = y * cosB - z1 * sinB;
+    let z2 = y * sinB + z1 * cosB;
+    // Perspective
+    const d = 600 * zoom;
+    const scale = d / (d + z2 + 300);
+    return {
+        sx: canvasW / 2 + x1 * scale * 30,
+        sy: canvasH / 2 + y1 * scale * 30,
+        depth: z2,
+        scale
+    };
+}
+
+function render() {
+    ctx.clearRect(0, 0, canvasW, canvasH);
+    if (neurons.length === 0) return;
+
+    // Project all neurons
+    const projected = neurons.map(n => {
+        const p = project3D(n.x || 0, n.y || 0, n.z || 0);
+        return { ...n, ...p };
+    });
+
+    // Build lookup
+    const lookup = {};
+    projected.forEach(n => lookup[n.id] = n);
+
+    // Sort by depth (back to front)
+    projected.sort((a, b) => b.depth - a.depth);
+
+    // Draw synapses
+    for (const s of synapses) {
+        const src = lookup[s.source];
+        const tgt = lookup[s.target];
+        if (!src || !tgt) continue;
+
+        const alpha = Math.min(Math.abs(s.weight) * 0.6, 0.4);
+        ctx.strokeStyle = s.type === 'excitatory'
+            ? `rgba(59,130,246,${alpha})`
+            : `rgba(239,68,68,${alpha})`;
+        ctx.lineWidth = Math.max(0.3, Math.abs(s.weight) * 1.5);
+        ctx.beginPath();
+        ctx.moveTo(src.sx, src.sy);
+        ctx.lineTo(tgt.sx, tgt.sy);
+        ctx.stroke();
+    }
+
+    // Draw neurons
+    for (const n of projected) {
+        const r = Math.max(2, 5 * n.scale);
+        const a = Math.max(0.3, Math.min(1, n.activation * 2 + 0.3));
+
+        let color;
+        if (n.type === 'input') color = `rgba(6,182,212,${a})`;
+        else if (n.type === 'output') color = `rgba(249,115,22,${a})`;
+        else color = `rgba(34,197,94,${a})`;
+
+        // Glow for high activation
+        if (n.activation > 0.5) {
+            ctx.shadowColor = color;
+            ctx.shadowBlur = 8 * n.scale;
+        }
+
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(n.sx, n.sy, r, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.shadowColor = 'transparent';
+        ctx.shadowBlur = 0;
+
+        // Selected highlight
+        if (n.id === selectedNeuronId) {
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.arc(n.sx, n.sy, r + 3, 0, Math.PI * 2);
+            ctx.stroke();
+        }
+    }
+}
+
+// ============================================================
+// CANVAS INTERACTION
+// ============================================================
+canvas.addEventListener('mousedown', e => {
+    dragStart = { x: e.clientX, y: e.clientY, rotX, rotY };
+});
+
+canvas.addEventListener('mousemove', e => {
+    if (!dragStart) return;
+    rotY = dragStart.rotY + (e.clientX - dragStart.x) * 0.005;
+    rotX = dragStart.rotX + (e.clientY - dragStart.y) * 0.005;
+    render();
+});
+
+canvas.addEventListener('mouseup', e => {
+    if (dragStart && Math.abs(e.clientX - dragStart.x) < 3 && Math.abs(e.clientY - dragStart.y) < 3) {
+        // Click - find nearest neuron
+        const rect = canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        const my = e.clientY - rect.top;
+
+        let closest = null, closestDist = 20;
+        for (const n of neurons) {
+            const p = project3D(n.x || 0, n.y || 0, n.z || 0);
+            const d = Math.sqrt((p.sx - mx) ** 2 + (p.sy - my) ** 2);
+            if (d < closestDist) { closest = n; closestDist = d; }
+        }
+
+        selectedNeuronId = closest ? closest.id : null;
+        if (closest) updateInspector(closest);
+        else document.getElementById('inspectorContent').innerHTML = '<div class="inspector-empty">Click a neuron to inspect it.</div>';
+        render();
+    }
+    dragStart = null;
+});
+
+canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    zoom = Math.max(0.2, Math.min(3, zoom - e.deltaY * 0.001));
+    render();
+}, { passive: false });
+
+window.addEventListener('resize', resizeCanvas);
+
+// ============================================================
+// INIT
+// ============================================================
+resizeCanvas();
+connectWebSocket();
+</script>
+</body>
+</html>

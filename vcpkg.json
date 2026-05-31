@@ -1,0 +1,16 @@
+{
+  "name": "neurograph",
+  "version-string": "0.1.0",
+  "description": "Self-organizing neural network system with CUDA acceleration",
+  "dependencies": [
+    "nlohmann-json",
+    "spdlog",
+    "gtest",
+    "libsodium",
+    "curl",
+    {
+      "name": "imgui",
+      "features": ["docking-experimental", "dx11-binding", "win32-binding"]
+    }
+  ]
+}

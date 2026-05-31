@@ -1,0 +1,124 @@
+# ============================================================
+# NeuroGraph .gitignore
+# ============================================================
+
+# --- Build artifacts -----------------------------------------
+build/
+build-*/
+out/
+cmake-build-*/
+[Dd]ebug/
+[Rr]elease/
+[Mm]inSizeRel/
+[Rr]elWith*/
+x64/
+x86/
+Win32/
+
+# --- vcpkg ---------------------------------------------------
+# Manifest mode installs into build/vcpkg_installed/
+vcpkg_installed/
+
+# --- IDE / tooling -------------------------------------------
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sln
+*.vcxproj
+*.vcxproj.*
+*.filters
+.cache/
+compile_commands.json
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+
+# --- MSVC intermediate files ---------------------------------
+*.obj
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.idb
+*.ilk
+*.tlog
+*.log
+*.iobj
+*.ipdb
+
+# --- CUDA intermediate ---------------------------------------
+*.cu.obj
+*.cudafe1.*
+*.fatbin*
+*.module_id
+*.ptx
+*.cubin
+
+# --- Compiled trained models ---------------------------------
+# Demo neural images shipped earlier — too large + reproducible.
+# Drop into datasets/fixtures/ if needed for tests.
+models/*.ngmodel
+models/*.ngmodel.json
+
+# --- Bundles / packaging staging -----------------------------
+packaging/windows/staging/
+*.msi
+*.cab
+
+# --- Datasets ------------------------------------------------
+# Small CSVs (iris, synthetic_*) are committed; large binary
+# datasets (MNIST IDX, image folders) are not. Re-fetch via
+# scripts/get_mnist.sh or document the source URL in
+# datasets/README.md.
+datasets/mnist/*-ubyte
+datasets/mnist/*-ubyte.gz
+datasets/cifar*/
+datasets/imagenet*/
+
+# --- Local dev caches & editor/assistant config -------------
+# Per-developer tooling state and editor/assistant config —
+# personal to each machine, not part of the product.
+.mem0/
+CLAUDE.md
+AGENT_NOTES.md
+AGENTS.md
+.claude/
+.cursor/
+.cursorrules
+.aider*
+.github/copilot-instructions.md
+
+# --- OS / editor cruft ---------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# --- Logs / temp ---------------------------------------------
+*.log
+*.tmp
+*.bak
+*.orig
+*~
+
+# --- Python (for tools/) -------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# --- License store / runtime state (per-user) ----------------
+# Issued license keys, trial timestamps — never commit.
+*.ngkey
+license_store.json
+trial_state.json
+
+# --- Test temp dirs ------------------------------------------
+# (Most tests use std::filesystem::temp_directory_path so this
+# is belt-and-suspenders.)
+tmp/
+.tmp/

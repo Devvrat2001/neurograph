@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+<head><title>WS Test</title></head>
+<body style="background:#111;color:#eee;font-family:monospace;padding:20px">
+<h2>WebSocket Connection Test</h2>
+<div id="log" style="white-space:pre-wrap;font-size:13px;max-height:80vh;overflow-y:auto"></div>
+<script>
+function log(msg) {
+    const d = document.getElementById('log');
+    const ts = new Date().toLocaleTimeString('en-US',{hour12:false});
+    d.textContent += `[${ts}] ${msg}\n`;
+    d.scrollTop = d.scrollHeight;
+    console.log(msg);
+}
+
+function connect() {
+    log('Connecting to ws://localhost:8765...');
+    const ws = new WebSocket('ws://localhost:8765');
+
+    ws.onopen = () => {
+        log('CONNECTED');
+        // Send a simple get_state command
+        const cmd = JSON.stringify({type:'command', action:'get_state'});
+        log('Sending: ' + cmd);
+        ws.send(cmd);
+    };
+
+    ws.onmessage = (e) => {
+        const data = e.data;
+        const size = data.length;
+        try {
+            const json = JSON.parse(data);
+            if (json.type === 'state') {
+                log(`Received STATE: ${json.neurons?.length || 0} neurons, ${json.synapses?.length || 0} synapses (${size} bytes)`);
+            } else if (json.type === 'registry') {
+                log(`Received REGISTRY: ${json.images?.length || 0} images (${size} bytes)`);
+            } else if (json.type === 'event') {
+                log(`Received EVENT: ${json.event} (${size} bytes)`);
+            } else {
+                log(`Received ${json.type}: ${size} bytes`);
+            }
+        } catch(e) {
+            log(`Received raw: ${size} bytes (parse error: ${e.message})`);
+        }
+    };
+
+    ws.onclose = (e) => {
+        log(`DISCONNECTED: code=${e.code} reason="${e.reason}" wasClean=${e.wasClean}`);
+        log('Reconnecting in 5s...');
+        setTimeout(connect, 5000);
+    };
+
+    ws.onerror = (e) => {
+        log(`ERROR: ${e.type}`);
+    };
+}
+
+connect();
+</script>
+</body>
+</html>

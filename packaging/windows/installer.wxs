@@ -1,0 +1,180 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  P1-10 — NeuroGraph Windows Installer (MSI).
+
+  Authored against WiX Toolset v5 (installed via `dotnet tool install -g wix`).
+
+  Inputs (passed in via -d on the wix command line, see
+  build_installer.ps1):
+    Version       Semver string for the MSI ProductVersion. Major
+                  upgrades require this to bump.
+    PayloadDir    Absolute path to the staging directory containing
+                  exactly the files we want to ship (workbench,
+                  predict, neurograph_rt.dll, vcpkg DLLs).
+    LicenseRtf    Path to LICENSE.rtf for the installer EULA dialog.
+    Manufacturer  Display name shown in Programs and Features. Also
+                  the SmartScreen "Publisher" once the MSI is signed.
+
+  Notes:
+    UpgradeCode is the *product identity* — it must NEVER change
+    across versions or upgrades become a side-by-side install. The
+    GUID below was generated once for NeuroGraph Phase-1 and is
+    pinned forever.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <Package
+      Name="NeuroGraph"
+      Manufacturer="$(var.Manufacturer)"
+      Version="$(var.Version)"
+      UpgradeCode="3F2A8B14-4D9E-4E2F-9A12-7C5B0E2D1A3F"
+      Compressed="yes"
+      InstallerVersion="500"
+      Scope="perMachine">
+
+    <SummaryInformation Description="NeuroGraph — neural networks made simple"
+                        Manufacturer="$(var.Manufacturer)"/>
+
+    <!--
+      MajorUpgrade with "Disallow" set to no means installing a newer
+      MSI on top of an older one performs an upgrade-uninstall +
+      reinstall sequence, which preserves the user's data dir and any
+      registry keys we mark Permanent="yes" (e.g. license key under
+      P1-11).
+    -->
+    <MajorUpgrade
+        Schedule="afterInstallInitialize"
+        DowngradeErrorMessage="A newer version of [ProductName] is already installed. Uninstall it first if you really mean to downgrade."/>
+
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high"/>
+
+    <!--
+      VCRedist 2015-2022 (x64) prerequisite check. We refuse to
+      install if VCRUNTIME140.dll isn't already on the system; the
+      alternative (bundling vcredist.exe inside the MSI and chaining
+      it via a Bundle/Burn) is bigger than this ticket. Customers'
+      IT teams universally have VCRedist deployed.
+    -->
+    <Property Id="VCRUNTIME_INSTALLED">
+      <DirectorySearch Id="System64Dir" Path="[System64Folder]" Depth="0">
+        <FileSearch Id="VCRuntime140Dll" Name="VCRUNTIME140.dll"/>
+      </DirectorySearch>
+    </Property>
+    <Launch
+        Condition="Installed OR VCRUNTIME_INSTALLED"
+        Message="NeuroGraph requires the Microsoft Visual C++ 2015-2022 Redistributable (x64). Please install it from https://aka.ms/vs/17/release/vc_redist.x64.exe and try again."/>
+
+    <!-- Install path picker dialog (WixUI_InstallDir) -->
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER"/>
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)"/>
+
+    <!--
+      Directory layout. Everything goes under
+      C:\Program Files\NeuroGraph\.
+    -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="NeuroGraph"/>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="NeuroGraph"/>
+    </StandardDirectory>
+
+    <!--
+      The single visible Feature. Hidden from the customizer dialog
+      via Display="hidden" because there are no optional sub-features
+      worth surfacing in a Phase-1 MVP.
+    -->
+    <Feature Id="MainFeature"
+             Title="NeuroGraph Workbench"
+             Level="1"
+             AllowAdvertise="no"
+             Display="expand">
+
+      <!--
+        Workbench EXE gets a hand-authored Component so we can hang
+        a Start Menu shortcut and the .ngm ProgId off it. Files()
+        below globs everything *else* in the payload directory.
+      -->
+      <Component Id="WorkbenchExeComponent" Directory="INSTALLFOLDER"
+                 Guid="9C81F07A-6B2D-4A7E-9E6C-2A1B3D4E5F60">
+        <File Id="WorkbenchExe"
+              Source="$(var.PayloadDir)\neurograph_workbench.exe"
+              KeyPath="yes"/>
+
+        <!-- Start Menu shortcut. -->
+        <Shortcut Id="StartMenuShortcut"
+                  Directory="ApplicationProgramsFolder"
+                  Name="NeuroGraph Workbench"
+                  Description="Train and deploy neural networks with no code."
+                  WorkingDirectory="INSTALLFOLDER"
+                  Advertise="no"/>
+        <!--
+          File extension association for .ngm (NeuroGraph Model).
+          Double-clicking a .ngm file launches the workbench with
+          the file path as argv[1]. The workbench can then route to
+          the snapshot loader.
+        -->
+        <ProgId Id="NeuroGraph.NgmFile.1"
+                Description="NeuroGraph Model"
+                Icon="WorkbenchExe">
+          <Extension Id="ngm" ContentType="application/x-neurograph-model">
+            <Verb Id="open"
+                  Command="Open"
+                  TargetFile="WorkbenchExe"
+                  Argument="&quot;%1&quot;"/>
+          </Extension>
+        </ProgId>
+      </Component>
+
+      <!-- Empty-folder cleanup for the Programs Menu folder. -->
+      <Component Id="StartMenuFolderCleanup"
+                 Directory="ApplicationProgramsFolder"
+                 Guid="A1B2C3D4-E5F6-4789-A1B2-C3D4E5F67890">
+        <RemoveFolder Id="ApplicationProgramsFolder" On="uninstall"/>
+        <!--
+          MSI requires a per-user reg key under HKCU to anchor a
+          per-user component, but we're per-machine. HKLM with a
+          fixed name is the canonical anchor for "this folder
+          existed because of us, remove it on uninstall".
+        -->
+        <RegistryValue Root="HKLM"
+                       Key="Software\NeuroGraph\Installer"
+                       Name="StartMenuFolderInstalled"
+                       Type="integer" Value="1"
+                       KeyPath="yes"/>
+      </Component>
+
+      <!--
+        Glob every other file in the payload — DLLs, predict.exe,
+        anything we drop into the staging dir. WiX 5's Files element
+        synthesizes a Component per file with a stable Id derived
+        from the relative path, so re-runs are deterministic.
+
+        We exclude the workbench EXE (already authored above) and
+        any PDB files (debug symbols are not part of the customer
+        payload).
+      -->
+      <Files Include="$(var.PayloadDir)\**">
+        <Exclude Files="$(var.PayloadDir)\neurograph_workbench.exe"/>
+        <Exclude Files="$(var.PayloadDir)\**\*.pdb"/>
+      </Files>
+
+      <!--
+        A registry value under HKLM\Software\NeuroGraph that other
+        components (P1-11 license key, future updater) can rely on
+        to find the install dir without re-querying MSI. Lives in
+        the same Feature so it's installed/uninstalled with the rest.
+      -->
+      <Component Id="InstallDirRegistry" Directory="INSTALLFOLDER"
+                 Guid="B7E5F1C0-9A3D-4B7E-A0E1-2C3D4E5F6789">
+        <RegistryValue Root="HKLM"
+                       Key="Software\NeuroGraph"
+                       Name="InstallDir"
+                       Type="string" Value="[INSTALLFOLDER]"
+                       KeyPath="yes"/>
+      </Component>
+    </Feature>
+
+  </Package>
+</Wix>
