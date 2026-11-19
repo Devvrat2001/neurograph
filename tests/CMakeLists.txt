@@ -45,7 +45,7 @@ add_executable(neurograph_tests
     integration/test_all_phases.cpp
     integration/test_auto_pipeline.cpp
     integration/test_predict_binary.cpp
-    ${CMAKE_SOURCE_DIR}/src/cuda_link_stub.cu
+    ${NEUROGRAPH_CUDA_LINK_STUB}
 )
 
 target_link_libraries(neurograph_tests PRIVATE
@@ -65,6 +65,10 @@ target_compile_definitions(neurograph_tests PRIVATE
     # Absolute path to the sklearn golden fixture. Compile-time bake
     # so the test runs from any CWD without env vars.
     NEUROGRAPH_SKLEARN_GOLDEN_PATH="${CMAKE_SOURCE_DIR}/tests/fixtures/eval/sklearn_golden.json"
+    # Sample datasets and a scratch location, without hard-coding a
+    # machine's own folders.
+    NEUROGRAPH_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    NEUROGRAPH_BINARY_DIR="${CMAKE_BINARY_DIR}"
 )
 
 set_target_properties(neurograph_tests PROPERTIES
@@ -72,10 +76,13 @@ set_target_properties(neurograph_tests PROPERTIES
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 
+# Runtime DLLs must be next to the exe before test discovery runs it
+# (post-build steps execute in the order they are declared).
+neurograph_attach_asan_runtime(neurograph_tests)
+neurograph_copy_runtime_dlls(neurograph_tests)
+
 include(GoogleTest)
 gtest_discover_tests(neurograph_tests)
-
-neurograph_attach_asan_runtime(neurograph_tests)
 
 # ---------------------------------------------------------------------------
 # neurograph_perf — separate executable for chrono-timed perf gates.
@@ -104,7 +111,7 @@ add_executable(neurograph_perf
     ${CMAKE_SOURCE_DIR}/src/workbench/wizard/step_quality.cpp
     ${CMAKE_SOURCE_DIR}/src/workbench/wizard/step_train.cpp
     ${CMAKE_SOURCE_DIR}/src/workbench/wizard/step_results.cpp
-    ${CMAKE_SOURCE_DIR}/src/cuda_link_stub.cu
+    ${NEUROGRAPH_CUDA_LINK_STUB}
 )
 
 target_link_libraries(neurograph_perf PRIVATE
@@ -130,8 +137,9 @@ set_target_properties(neurograph_perf PROPERTIES
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 
+neurograph_attach_asan_runtime(neurograph_perf)
+neurograph_copy_runtime_dlls(neurograph_perf)
+
 gtest_discover_tests(neurograph_perf
     PROPERTIES LABELS "perf"
 )
-
-neurograph_attach_asan_runtime(neurograph_perf)
