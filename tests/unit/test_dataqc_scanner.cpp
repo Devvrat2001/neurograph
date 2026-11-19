@@ -120,7 +120,7 @@ TEST(DataQcScanner, MissingValuesAtWarningThreshold) {
     std::string body = "x,y,label\n";
     for (int i = 0; i < 10; ++i) {
         const std::string xv = (i == 0) ? "" : std::to_string(i);
-        body += xv + "," + std::to_string(i * 2) + ",A\n";
+        body += xv + "," + std::to_string(i * 2) + (i % 2 ? ",A\n" : ",B\n");
     }
     TempCsv csv("missing.csv", body);
     const auto r = scan_csv(csv.path(), test_opts());
@@ -131,19 +131,52 @@ TEST(DataQcScanner, MissingValuesAtWarningThreshold) {
     EXPECT_TRUE(r.trainable);  // warnings don't block training
 }
 
-TEST(DataQcScanner, MissingValuesAtErrorThresholdBlocksTraining) {
-    // 10 rows, 5 missing in `x` → 50% missing. Default err = 40%.
+TEST(DataQcScanner, HeavilyBlankInputColumnWarnsButDoesNotBlock) {
+    // 10 rows, 5 blank in `x` → 50% blank, above the 40% "consider leaving
+    // it out" level. Gaps are filled automatically, so training goes ahead.
     std::string body = "x,y,label\n";
     for (int i = 0; i < 10; ++i) {
         const std::string xv = (i < 5) ? "" : std::to_string(i);
-        body += xv + "," + std::to_string(i) + ",A\n";
+        body += xv + "," + std::to_string(i) + (i % 2 ? ",A\n" : ",B\n");
     }
     TempCsv csv("missing_err.csv", body);
     const auto r = scan_csv(csv.path(), test_opts());
     const Finding* f = r.find_code("MISSING_VALUES");
     ASSERT_NE(f, nullptr);
+    EXPECT_EQ(f->column, "x");
+    EXPECT_EQ(f->severity, Severity::Warning);
+    EXPECT_NE(f->message.find("50% blank"), std::string::npos) << f->message;
+    EXPECT_NE(f->remedy.find("leaving it out"), std::string::npos) << f->remedy;
+    EXPECT_TRUE(r.trainable);
+}
+
+TEST(DataQcScanner, ConstantTargetBlocksTraining) {
+    // Nothing to predict when the target has one value on every row.
+    std::string body = "x,label\n";
+    for (int i = 0; i < 30; ++i) body += std::to_string(i) + ",A\n";
+    TempCsv csv("constant_target.csv", body);
+    const auto r = scan_csv(csv.path(), test_opts());
+    const Finding* f = r.find_code("TARGET_CONSTANT");
+    ASSERT_NE(f, nullptr);
     EXPECT_EQ(f->severity, Severity::Error);
     EXPECT_FALSE(r.trainable);
+}
+
+TEST(DataQcScanner, ChecksAreMadeAgainstTheChosenTarget) {
+    // `label` is first, not last. With target_column set, the imbalance
+    // check looks at it rather than at the last column.
+    std::string body = "label,x\n";
+    for (int i = 0; i < 60; ++i) body += "A," + std::to_string(i) + "\n";
+    for (int i = 0; i < 4;  ++i) body += "B," + std::to_string(i) + "\n";
+    TempCsv csv("target_first.csv", body);
+    auto opts = test_opts();
+    opts.target_column = "label";
+    const auto r = scan_csv(csv.path(), opts);
+    const Finding* f = r.find_code("CLASS_IMBALANCE");
+    ASSERT_NE(f, nullptr);
+    EXPECT_EQ(f->column, "label");
+    EXPECT_GE(r.class_imbalance_ratio, 10.0);
+    EXPECT_TRUE(r.trainable);
 }
 
 TEST(DataQcScanner, AllNanColumnEmitsAllNanColumn) {
@@ -186,7 +219,7 @@ TEST(DataQcScanner, HighCardinalityEmitsWarning) {
     EXPECT_EQ(f->column, "user_id");
 }
 
-TEST(DataQcScanner, ClassImbalanceWarnThenError) {
+TEST(DataQcScanner, ClassImbalanceWarnsAtBothLevels) {
     // 50 A + 4 B → ratio ~12.5 → WARN threshold (10) hit, ERROR (50) not.
     {
         std::string body = "x,label\n";
@@ -199,7 +232,8 @@ TEST(DataQcScanner, ClassImbalanceWarnThenError) {
         EXPECT_EQ(f->severity, Severity::Warning);
         EXPECT_GE(r.class_imbalance_ratio, 10.0);
     }
-    // 100 A + 1 B → ratio 100 → ERROR threshold (50) hit.
+    // 100 A + 1 B → ratio 100 → past the severe level (50): a stronger
+    // warning that explains why accuracy will mislead, but not a block.
     {
         std::string body = "x,label\n";
         for (int i = 0; i < 100; ++i) body += "1,A\n";
@@ -208,8 +242,9 @@ TEST(DataQcScanner, ClassImbalanceWarnThenError) {
         const auto r = scan_csv(csv.path(), test_opts());
         const Finding* f = r.find_code("CLASS_IMBALANCE");
         ASSERT_NE(f, nullptr);
-        EXPECT_EQ(f->severity, Severity::Error);
-        EXPECT_FALSE(r.trainable);
+        EXPECT_EQ(f->severity, Severity::Warning);
+        EXPECT_NE(f->remedy.find("rare"), std::string::npos) << f->remedy;
+        EXPECT_TRUE(r.trainable);
     }
 }
 
@@ -230,8 +265,8 @@ TEST(DataQcScanner, TargetLeakageDetectsNearPerfectCorrelation) {
     const Finding* f = r.find_code("TARGET_LEAKAGE_SUSPECT");
     ASSERT_NE(f, nullptr);
     EXPECT_EQ(f->column, "leak");
-    EXPECT_EQ(f->severity, Severity::Error);
-    EXPECT_FALSE(r.trainable);
+    EXPECT_EQ(f->severity, Severity::Warning);
+    EXPECT_TRUE(r.trainable);
 }
 
 TEST(DataQcScanner, DuplicateRowsEmitWarning) {

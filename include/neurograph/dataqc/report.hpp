@@ -20,6 +20,12 @@
 //   MIXED_TYPES              — numeric column contains un-parseable values
 //   ALL_NAN_COLUMN           — column is entirely missing
 //   OUTLIERS                 — >5% of rows outside mean±5σ
+//   TARGET_CONSTANT          — target column has one distinct value
+//
+// Only FILE_NOT_FOUND, EMPTY_FILE, TOO_FEW_ROWS, TARGET_CONSTANT and an
+// all-blank target are errors (they make training impossible). Everything
+// else is a warning or a note: the pipeline handles it, and the user can
+// leave a column out.
 
 #include <string>
 #include <utility>

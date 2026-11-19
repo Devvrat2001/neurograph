@@ -1,4 +1,5 @@
 #include "neurograph/dataqc/scanner.hpp"
+#include "neurograph/util/text_parse.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -86,46 +87,10 @@ std::string trim(std::string s) {
     return s;
 }
 
-// Attempts to parse as a floating-point number. Recognizes standard
-// NaN markers (empty, "nan", "NA", "null", "?") as "missing" and returns
-// {parsed, true_if_missing}. Returns {NaN, false, false} when the value
-// is a non-missing string that doesn't look numeric.
-struct NumericParse {
-    double value       = 0.0;
-    bool   parsed      = false;   // successfully parsed as number
-    bool   is_missing  = false;   // looks like a missing-value token
-};
-
-NumericParse try_parse_number(std::string_view raw) {
-    NumericParse out{};
-    const std::string s = trim(std::string(raw));
-    if (s.empty()) { out.is_missing = true; return out; }
-
-    // Common "missing" string tokens. Case-insensitive compare.
-    auto eq_ci = [](std::string_view a, std::string_view b) {
-        if (a.size() != b.size()) return false;
-        for (std::size_t i = 0; i < a.size(); ++i) {
-            if (std::tolower(static_cast<unsigned char>(a[i])) !=
-                std::tolower(static_cast<unsigned char>(b[i]))) return false;
-        }
-        return true;
-    };
-    for (std::string_view tok : {"nan", "na", "n/a", "null", "none", "?", "-"}) {
-        if (eq_ci(s, tok)) { out.is_missing = true; return out; }
-    }
-
-    // std::from_chars is locale-independent and rejects partial matches —
-    // exactly what we want for CSV data integrity.
-    double v = 0.0;
-    const char* first = s.data();
-    const char* last  = s.data() + s.size();
-    auto result = std::from_chars(first, last, v);
-    if (result.ec == std::errc{} && result.ptr == last) {
-        out.value = v;
-        out.parsed = true;
-    }
-    return out;
-}
+// Number parsing is shared with the preprocessing pipeline so the scanner
+// and the model agree on what counts as a number or a blank.
+using util::NumericParse;
+using util::try_parse_number;
 
 // Welford's online mean/variance — one pass, numerically stable. Tracks
 // min/max alongside.
@@ -404,6 +369,7 @@ read_csv_into(CsvData& out,
     strip_bom(line);
     strip_cr(line);
     out.header = parse_csv_line(line);
+    for (auto& h : out.header) h = trim(std::move(h));
     out.columns.resize(out.header.size());
     for (std::size_t i = 0; i < out.header.size(); ++i) {
         out.columns[i].name = out.header[i];
@@ -481,32 +447,70 @@ void emit_findings(DataQualityReport& r, const CsvData& data,
             " more rows or reduce task complexity."));
     }
 
+    // Which column is being predicted. Defaults to the last one.
+    int target_idx = n_cols - 1;
+    if (!opts.target_column.empty()) {
+        for (int c = 0; c < n_cols; ++c) {
+            if (data.header[c] == opts.target_column) { target_idx = c; break; }
+        }
+    }
+
     // Per-column findings.
+    //
+    // Severity policy: only problems that make training impossible are
+    // errors (and those concern the file or the target). A troublesome
+    // input column is a warning, because the pipeline deals with it —
+    // blank columns are left out, gaps are filled — and the user can
+    // always leave a column out.
     const auto n_rows_d = static_cast<double>(n_rows);
     for (int c = 0; c < n_cols; ++c) {
         const auto& col = data.columns[c];
         const std::string& name = data.header[c];
         const double missing_frac = col.n_missing / n_rows_d;
+        const bool is_target = (c == target_idx);
 
         if (col.n_missing == n_rows) {
-            r.findings.push_back(make_finding(
-                Severity::Error, "ALL_NAN_COLUMN", name,
-                "Every value in '" + name + "' is missing.",
-                "Drop the column from the dataset."));
-            continue;  // no other findings matter for an all-NaN column
+            if (is_target) {
+                r.findings.push_back(make_finding(
+                    Severity::Error, "ALL_NAN_COLUMN", name,
+                    "Every value in the target column '" + name + "' is blank.",
+                    "Pick a different column to predict."));
+            } else {
+                r.findings.push_back(make_finding(
+                    Severity::Warning, "ALL_NAN_COLUMN", name,
+                    "Every value in '" + name + "' is blank.",
+                    "The column will be left out."));
+            }
+            continue;  // no other findings matter for an all-blank column
         }
-        if (missing_frac >= opts.missing_error_frac) {
+        if (is_target && col.n_missing > 0) {
             r.findings.push_back(make_finding(
-                Severity::Error, "MISSING_VALUES", name,
+                Severity::Warning, "MISSING_VALUES", name,
+                std::to_string(col.n_missing) + " rows have a blank target ('" +
+                name + "').",
+                "Those rows will be skipped; there is nothing to learn from them."));
+        } else if (missing_frac >= opts.missing_error_frac) {
+            r.findings.push_back(make_finding(
+                Severity::Warning, "MISSING_VALUES", name,
                 "Column '" + name + "' is " +
-                std::to_string(int(missing_frac * 100)) + "% missing.",
-                "Impute aggressively or drop the column — too much data is lost."));
+                std::to_string(int(missing_frac * 100)) + "% blank.",
+                "Gaps are filled in automatically, but a column this empty adds "
+                "little. Consider leaving it out."));
         } else if (missing_frac >= opts.missing_warn_frac) {
             r.findings.push_back(make_finding(
                 Severity::Warning, "MISSING_VALUES", name,
                 "Column '" + name + "' is " +
-                std::to_string(int(missing_frac * 100)) + "% missing.",
-                "Impute or drop. Enable 'Auto-impute' in Preprocessing."));
+                std::to_string(int(missing_frac * 100)) + "% blank.",
+                "Gaps are filled in automatically."));
+        }
+
+        if (is_target && !col.cardinality_overflowed
+            && col.category_counts.size() == 1) {
+            r.findings.push_back(make_finding(
+                Severity::Error, "TARGET_CONSTANT", name,
+                "The target column '" + name + "' has the same value on every row.",
+                "There is nothing to predict. Pick a different column."));
+            continue;
         }
 
         // CONSTANT_COLUMN — after excluding missing, is there only one value?
@@ -527,15 +531,16 @@ void emit_findings(DataQualityReport& r, const CsvData& data,
         }
 
         // HIGH_CARDINALITY — categorical with > max(100, n_rows*0.5) uniques.
-        if (!is_numeric) {
+        if (!is_numeric && !is_target) {
             const int threshold = std::max(100, n_rows / 2);
             if (col.cardinality_overflowed ||
                 static_cast<int>(col.category_counts.size()) > threshold) {
                 r.findings.push_back(make_finding(
                     Severity::Warning, "HIGH_CARDINALITY", name,
-                    "Column '" + name + "' has too many distinct values to "
-                    "one-hot encode efficiently.",
-                    "Consider hashing or embedding instead of one-hot."));
+                    "Column '" + name + "' has a very large number of different "
+                    "values.",
+                    "If it is an identifier or free text it will be left out; "
+                    "otherwise only the most common values are kept."));
             }
         }
 
@@ -587,14 +592,19 @@ void emit_findings(DataQualityReport& r, const CsvData& data,
             "Dedupe via the Preprocessing panel."));
     }
 
-    // CLASS_IMBALANCE — on the last column when it looks categorical.
+    // CLASS_IMBALANCE — on the target column when it holds classes.
     // Ratio = most_common / least_common. 1.0 means perfectly balanced.
     r.class_imbalance_ratio = 1.0;
     if (n_cols >= 1) {
-        const auto& target = data.columns[n_cols - 1];
+        const auto& target = data.columns[target_idx];
         const bool target_numeric = column_is_numeric(target);
-        if (!target_numeric && !target.cardinality_overflowed &&
-            target.category_counts.size() >= 2) {
+        // Same rule the pipeline uses to tell classes from quantities.
+        const std::size_t class_limit = std::max<std::size_t>(
+            20, static_cast<std::size_t>(std::sqrt(static_cast<double>(n_rows))));
+        const bool holds_classes =
+            !target.cardinality_overflowed && target.category_counts.size() >= 2
+            && (!target_numeric || target.category_counts.size() <= class_limit);
+        if (holds_classes) {
             int mn = std::numeric_limits<int>::max();
             int mx = 0;
             for (const auto& kv : target.category_counts) {
@@ -607,19 +617,20 @@ void emit_findings(DataQualityReport& r, const CsvData& data,
             }
             if (r.class_imbalance_ratio >= opts.imbalance_error_at) {
                 r.findings.push_back(make_finding(
-                    Severity::Error, "CLASS_IMBALANCE", target.name,
-                    "Class frequencies differ by a factor of " +
+                    Severity::Warning, "CLASS_IMBALANCE", target.name,
+                    "The rarest class in '" + target.name + "' is about " +
                     std::to_string(static_cast<int>(r.class_imbalance_ratio)) +
-                    ":1 in the target column.",
-                    "Use class weights, oversample minorities, or collect more "
-                    "samples of the rarer classes."));
+                    " times rarer than the commonest.",
+                    "Overall accuracy will look high even for a useless model. "
+                    "Judge the result by how many of the rare cases it finds, "
+                    "and collect more of them if you can."));
             } else if (r.class_imbalance_ratio >= opts.imbalance_warn_at) {
                 r.findings.push_back(make_finding(
                     Severity::Warning, "CLASS_IMBALANCE", target.name,
                     "Class frequencies differ by a factor of " +
                     std::to_string(static_cast<int>(r.class_imbalance_ratio)) +
                     ":1 in the target column.",
-                    "Use class weights or collect more minority samples."));
+                    "Check the per-class results, not just overall accuracy."));
             }
         }
     }
@@ -628,9 +639,10 @@ void emit_findings(DataQualityReport& r, const CsvData& data,
     // with a numeric target. Cheap to compute; skip when either side is
     // non-numeric (categorical correlation needs a different method).
     if (n_cols >= 2) {
-        const auto& target = data.columns[n_cols - 1];
+        const auto& target = data.columns[target_idx];
         if (column_is_numeric(target)) {
-            for (int c = 0; c < n_cols - 1; ++c) {
+            for (int c = 0; c < n_cols; ++c) {
+                if (c == target_idx) continue;
                 const auto& col = data.columns[c];
                 if (!column_is_numeric(col)) continue;
                 if (col.numeric_cache.size() < 10 ||
@@ -650,14 +662,14 @@ void emit_findings(DataQualityReport& r, const CsvData& data,
                 if (!std::isnan(corr) &&
                     std::abs(corr) > opts.leakage_corr_threshold) {
                     r.findings.push_back(make_finding(
-                        Severity::Error, "TARGET_LEAKAGE_SUSPECT",
+                        Severity::Warning, "TARGET_LEAKAGE_SUSPECT",
                         data.header[c],
-                        "Feature '" + data.header[c] + "' is nearly perfectly "
-                        "correlated (|r| > " +
-                        std::to_string(opts.leakage_corr_threshold) +
-                        ") with the target. This usually indicates leakage.",
-                        "Remove '" + data.header[c] + "' — it looks like "
-                        "target leakage."));
+                        "'" + data.header[c] + "' tracks the target almost "
+                        "exactly. That usually means it is another form of the "
+                        "answer rather than something known beforehand.",
+                        "If '" + data.header[c] + "' is only known after the "
+                        "outcome, leave it out; otherwise the model will look "
+                        "accurate and be useless."));
                 }
             }
         }

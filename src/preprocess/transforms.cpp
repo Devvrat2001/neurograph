@@ -1,3 +1,4 @@
+#include "neurograph/util/text_parse.hpp"
 #include "neurograph/preprocess/transforms.hpp"
 
 #include <algorithm>
@@ -259,8 +260,11 @@ std::vector<double> Encoder::apply(const std::string& raw) const {
     case EncodeStrategy::HashFixedBuckets: {
         const int n = std::max(1, hash_buckets);
         std::vector<double> out(static_cast<std::size_t>(n), 0.0);
-        const std::size_t h = std::hash<std::string>{}(raw);
-        out[h % static_cast<std::size_t>(n)] = 1.0;
+        // Fixed hash, not std::hash: the bucket must not depend on which
+        // standard library built the program. (FNV-1a is also what MSVC's
+        // std::hash<std::string> computes, so existing bundles are unaffected.)
+        const std::uint64_t h = util::fnv1a64(raw);
+        out[static_cast<std::size_t>(h % static_cast<std::uint64_t>(n))] = 1.0;
         return out;
     }
     }

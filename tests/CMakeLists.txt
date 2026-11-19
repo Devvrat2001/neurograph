@@ -37,6 +37,7 @@ add_executable(neurograph_tests
     unit/test_capi.cpp
     unit/test_wizard_state.cpp
     unit/test_models.cpp
+    unit/test_preprocess_rules.cpp
     # The C ABI translation unit is compiled *into* the test exe with
     # NEUROGRAPH_RT_STATIC=1 so we don't have to chase the neurograph_rt
     # DLL around at test time. The same source, built separately into

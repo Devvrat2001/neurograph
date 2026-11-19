@@ -19,10 +19,15 @@
 #include "neurograph/training/data_loader.hpp"   // for training::Sample
 
 #include <filesystem>
+#include <string>
 
 namespace neurograph::dataqc {
 
 struct ScanOptions {
+    // Header name of the column being predicted. Empty means the last
+    // column. Class-imbalance and leakage checks are made against it.
+    std::string target_column;
+
     // Max categories to surface in ColumnStats::top_categories per column.
     int    top_k_categories      = 5;
 
@@ -60,7 +65,8 @@ struct ScanOptions {
     int    max_uniques_tracked   = 1024;
 };
 
-/// Scan a CSV. The last column is assumed to be the target. Passes the
+/// Scan a CSV. The target is `opts.target_column`, or the last column when
+/// that is empty. Passes the
 /// file stream once if file size < max_file_bytes_full_scan, otherwise
 /// reservoir-samples sample_cap rows.
 ///
