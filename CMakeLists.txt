@@ -254,6 +254,12 @@ add_library(neurograph_lib STATIC
     src/dataqc/scanner.cpp
     src/preprocess/transforms.cpp
     src/preprocess/pipeline.cpp
+    # Native model families + automatic selection (linear, dense network
+    # that grows its hidden layer, gradient-boosted trees, blends).
+    src/models/model.cpp
+    src/models/mlp.cpp
+    src/models/gbt.cpp
+    src/models/automl.cpp
 )
 
 target_include_directories(neurograph_lib PUBLIC
