@@ -131,6 +131,7 @@ jobs:
           # binaries and the legacy `neurograph` CLI.
           cmake --build build --config Release --parallel `
             --target neurograph_workbench `
+            --target neurograph_train `
             --target neurograph_predict `
             --target neurograph_rt
           if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }

@@ -1,6 +1,6 @@
 #include "neurograph/eval/learning_curve.hpp"
 
-#include <spdlog/spdlog.h>
+#include "neurograph/util/logger.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -99,7 +99,7 @@ LearningCurveReport compute_learning_curve(
     TrainerFn                             trainer)
 {
     if (!trainer) {
-        spdlog::warn("compute_learning_curve called with null trainer");
+        NG_LOG_WARN("compute_learning_curve called with null trainer");
         return make_inconclusive(kMsgInconclusive);
     }
     if (ds.X_val.empty()) {

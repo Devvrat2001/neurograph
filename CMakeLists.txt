@@ -5,6 +5,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# One version string for the whole product: bundle manifests, the C API,
+# and the command-line tools' --version all read it from here.
+add_compile_definitions(NEUROGRAPH_VERSION_STRING="${PROJECT_VERSION}")
+
 # --- Options ---
 option(NEUROGRAPH_BUILD_TESTS "Build unit and integration tests" ON)
 
@@ -249,6 +253,7 @@ add_library(neurograph_lib STATIC
     src/licensing/license_revocation.cpp
     src/orchestration/auto_pipeline.cpp
     src/runtime/bundle.cpp
+    src/runtime/score.cpp
     src/workbench/wizard/wizard_state.cpp
     src/workbench/wizard/csv_preview.cpp
     src/dataqc/scanner.cpp
@@ -325,6 +330,18 @@ set_target_properties(neurograph_predict PROPERTIES
 )
 neurograph_attach_asan_runtime(neurograph_predict)
 neurograph_copy_runtime_dlls(neurograph_predict)
+
+# --- Command-line trainer ---
+#
+# The wizard's Train button without the GUI: CSV in, bundle out. Used for
+# scripting, servers without a desktop, and the accuracy benchmarks.
+add_executable(neurograph_train
+    src/cli/train_main.cpp
+    ${NEUROGRAPH_CUDA_LINK_STUB}
+)
+target_link_libraries(neurograph_train PRIVATE neurograph_lib)
+neurograph_attach_asan_runtime(neurograph_train)
+neurograph_copy_runtime_dlls(neurograph_train)
 
 # --- C ABI shared library (P1-08) ---
 #

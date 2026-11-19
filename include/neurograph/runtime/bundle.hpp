@@ -39,6 +39,8 @@
 #include <variant>
 #include <vector>
 
+namespace neurograph::models { class Model; }
+
 namespace neurograph::runtime {
 
 /// Linear probe — classification head. Mirrors the orchestrator's
@@ -93,6 +95,19 @@ struct NeuralNetRegressionModel {
     NeuralNetRegressionModel& operator=(NeuralNetRegressionModel&&) noexcept;
 };
 
+// ---------------------------------------------------------------------------
+// Native models — schema_version 3. Whatever the automatic trainer chose
+// (gradient-boosted trees, dense network, linear model or a blend),
+// behind one interface. Stateless at prediction time, so no lock is needed
+// to share one bundle between threads.
+// ---------------------------------------------------------------------------
+struct NativeModel {
+    std::shared_ptr<const models::Model> impl;
+    int                                  n_features = 0;
+    int                                  n_classes  = 0;   // 0 for regression
+    std::vector<std::string>             class_labels;
+};
+
 /// What `load_bundle` returns. The pipeline is held in a unique_ptr
 /// because `FittedPipeline` is move-only and pImpl-shaped. Neural-net
 /// inference state is similarly opaque.
@@ -101,11 +116,13 @@ struct ModelBundle {
     std::variant<LinearClassificationModel,
                  LinearRegressionModel,
                  NeuralNetClassificationModel,
-                 NeuralNetRegressionModel>        model;
+                 NeuralNetRegressionModel,
+                 NativeModel>                     model;
     nlohmann::json                               manifest;   // empty {} if missing
     std::filesystem::path                        source_dir;
 
     bool is_classification() const noexcept {
+        if (const auto* m = std::get_if<NativeModel>(&model)) return m->n_classes >= 2;
         return std::holds_alternative<LinearClassificationModel>(model)
             || std::holds_alternative<NeuralNetClassificationModel>(model);
     }
@@ -116,8 +133,16 @@ struct ModelBundle {
             return m->n_classes;
         if (const auto* m = std::get_if<NeuralNetClassificationModel>(&model))
             return m->n_classes;
+        if (const auto* m = std::get_if<NativeModel>(&model))
+            return m->n_classes;
         return 0;
     }
+
+    /// Width of the feature vector the model takes (after preprocessing).
+    int n_features() const noexcept;
+
+    /// One line describing the model, for display. Empty for old bundles.
+    std::string description() const;
 
     /// Pretty class label by id. Safe when `i` is out of range (returns
     /// empty string).
@@ -147,6 +172,14 @@ struct Prediction {
 /// expected vs. actual schema version. Suitable for printing to stderr.
 util::Result<ModelBundle>
 load_bundle(const std::filesystem::path& dir);
+
+/// CSV columns the model needs that are absent from `header`. A scoring
+/// run should refuse to start when this is non-empty: predicting from a
+/// file with a misspelt or missing column silently fills the gap with an
+/// average and returns confident nonsense.
+std::vector<std::string>
+missing_input_columns(const ModelBundle& bundle,
+                      const std::vector<std::string>& header);
 
 /// Run inference on a single raw row (keys = original CSV column
 /// names). Internally calls `preprocess::apply_pipeline` then the

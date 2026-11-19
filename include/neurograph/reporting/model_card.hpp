@@ -27,11 +27,13 @@
 #include "neurograph/eval/classification.hpp"
 #include "neurograph/eval/learning_curve.hpp"
 #include "neurograph/eval/regression.hpp"
+#include "neurograph/models/automl.hpp"
 #include "neurograph/preprocess/pipeline.hpp"
 #include "neurograph/training/training_engine.hpp"
 
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace neurograph::reporting {
 
@@ -71,9 +73,40 @@ struct ModelCardInputs {
     /// determinism contract holds — every byte is a function of inputs.
     std::string                          generated_at_iso8601;
 
-    /// Original CSV path used for training. Shown in the data summary;
-    /// empty → omitted.
+    /// Original CSV path used for training. Only the file name is printed
+    /// (a card is often shared; the full path can carry a user name).
+    /// Empty → omitted.
     std::string                          dataset_path;
+
+    // --- Automatic model selection (0.2+). When `candidates` is empty the
+    // --- card falls back to the legacy single-network sections above.
+
+    /// One line describing the chosen model, and why it was chosen.
+    std::string                          model_description;
+    std::string                          model_choice_reason;
+
+    /// Every model tried, in the order trained; one has `chosen` set.
+    std::vector<models::Candidate>       candidates;
+
+    /// What happened to each CSV column.
+    std::vector<preprocess::ColumnDecision> columns;
+
+    /// How much the model relies on each input column, most first.
+    struct Importance {
+        std::string column;
+        double      relative   = 0.0;   // 1.0 for the most important column
+        double      score_drop = 0.0;   // fall in accuracy / R² when shuffled
+    };
+    std::vector<Importance>              importance;
+
+    /// Which rows the Evaluation numbers come from, as a phrase:
+    /// "23 rows held back from training and model selection".
+    std::string                          evaluated_on;
+
+    int n_train = 0;
+    int n_val   = 0;
+    int n_test  = 0;
+    int rows_dropped_missing_target = 0;
 };
 
 /// Render a markdown model card. Pure function: no I/O, no globals,

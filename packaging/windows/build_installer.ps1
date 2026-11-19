@@ -71,9 +71,10 @@ Write-Host "==> Staging payload at $StagingDir" -ForegroundColor Cyan
 if (Test-Path $StagingDir) { Remove-Item $StagingDir -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $StagingDir | Out-Null
 
-# Targets we author (workbench, predict CLI, C ABI runtime DLL).
+# Targets we author (workbench, train and predict CLIs, C ABI runtime DLL).
 $ProductFiles = @(
   "neurograph_workbench.exe",
+  "neurograph_train.exe",
   "neurograph_predict.exe",
   "neurograph_rt.dll"
 )
