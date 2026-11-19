@@ -407,6 +407,7 @@ add_executable(neurograph_workbench WIN32
     src/workbench/wizard/step_quality.cpp
     src/workbench/wizard/step_train.cpp
     src/workbench/wizard/step_results.cpp
+    src/workbench/wizard/native_dialogs.cpp
     # P1-11 license dialog -- ImGui-bound, so workbench-only. The
     # crypto/persistence/trial logic lives in neurograph_lib.
     src/workbench/license_dialog.cpp
@@ -417,6 +418,10 @@ target_link_libraries(neurograph_workbench PRIVATE
     imgui::imgui
     d3d11
     dxgi
+    # File dialogs (COM) and drag-and-drop.
+    ole32
+    shell32
+    uuid
 )
 target_include_directories(neurograph_workbench PRIVATE
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}

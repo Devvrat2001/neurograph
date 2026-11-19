@@ -17,6 +17,7 @@
 
 #include "neurograph/workbench/wizard_state.hpp"
 
+#include <filesystem>
 #include <memory>
 #include <thread>
 
@@ -37,6 +38,11 @@ struct WizardRuntime {
     // `joinable()` alone isn't enough because a finished thread is
     // still joinable until you call .join() on it.
     bool worker_active = false;
+
+    // A file dropped onto the window (WM_DROPFILES). The window procedure
+    // writes it; the Load step consumes and clears it on the next frame.
+    // Both run on the UI thread.
+    std::filesystem::path dropped_file;
 };
 
 /// Construct a fresh runtime. Moving requires manual work — the

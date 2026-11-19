@@ -24,12 +24,14 @@
 // crypto/persistence/trial logic stays in neurograph_lib so the unit
 // tests can exercise it without spinning up D3D11.
 #include "license_dialog.hpp"
+#include "neurograph/licensing/license.hpp"
 
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 #include <d3d11.h>
+#include <shellapi.h>
 
 #include <random>
 #include <chrono>
@@ -2261,6 +2263,20 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             g_ResizeHeight = HIWORD(lParam);
         }
         return 0;
+    case WM_DROPFILES: {
+        // A file dragged onto the window: hand the first one to the
+        // wizard's Load step, which picks it up on the next frame.
+        HDROP drop = reinterpret_cast<HDROP>(wParam);
+        wchar_t path[4096];
+        const bool busy = g_wizard_state.status.load() == workbench::TrainingStatus::Running;
+        if (!busy && DragQueryFileW(drop, 0, path, sizeof(path) / sizeof(path[0])) > 0) {
+            if (!g_wizard_runtime) g_wizard_runtime = workbench::make_wizard_runtime();
+            g_wizard_runtime->dropped_file = std::filesystem::path(path);
+            g_wizard_state.current_step = workbench::WizardStep::Load;
+        }
+        DragFinish(drop);
+        return 0;
+    }
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -2292,6 +2308,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     RegisterClassExW(&wc);
     HWND hwnd = CreateWindowW(wc.lpszClassName, L"NeuroGraph Workbench",
         WS_OVERLAPPEDWINDOW, 100, 50, winW, winH, nullptr, nullptr, wc.hInstance, nullptr);
+    DragAcceptFiles(hwnd, TRUE);   // CSV files can be dropped onto the window
 
     if (!CreateDeviceD3D(hwnd)) {
         CleanupDeviceD3D();
@@ -2337,7 +2354,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     // valid key. The probe itself is in neurograph_lib so it's unit-
     // tested without touching D3D11.
     g_app.license_status = workbench::boot_license_state();
-    if (!g_app.license_status.license) {
+    if (!licensing::licensing_configured()) {
+        // No vendor key in this build, so no key could ever verify.
+        // Locking the app would make it unusable; run unlicensed.
+        add_event("LICENSE", "This build has no licence check; all features are available");
+    } else if (!g_app.license_status.license) {
         g_app.license_dialog.modal_block = true;
         g_app.license_dialog.open        = true;
         if (g_app.license_status.trial_days_left < 0) {

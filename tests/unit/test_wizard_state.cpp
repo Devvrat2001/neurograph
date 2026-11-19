@@ -139,11 +139,11 @@ TEST_F(WizardStateTest, ChangingTargetInvalidatesDqReport) {
 TEST_F(WizardStateTest, SettingNewCsvClearsDownstreamState) {
     set_csv(state, make_csv_meta());
     set_dq_report(state, make_report(false, true));
-    toggle_fix(state, "MISSING_VALUES");
+    ASSERT_TRUE(toggle_excluded_column(state, state.csv->columns.front()));
 
     set_csv(state, make_csv_meta({"x","y","z","newtarget"}));
     EXPECT_FALSE(state.dq_report.has_value());
-    EXPECT_TRUE(state.auto_fixes_applied.empty());
+    EXPECT_TRUE(state.excluded_columns.empty());
     EXPECT_EQ(state.target_column, "newtarget");
 }
 
@@ -190,48 +190,47 @@ TEST_F(WizardStateTest, AdvanceFromQualityWhenWarningsOnly) {
     EXPECT_EQ(state.current_step, WizardStep::Train);
 }
 
-TEST_F(WizardStateTest, ToggleFixAddsThenRemovesCode) {
+TEST_F(WizardStateTest, ExcludeColumnTogglesAndReachesTheOptions) {
     set_csv(state, make_csv_meta());
-    advance(state);
-    set_dq_report(state, make_report(false, true));
+    const std::string col = state.csv->columns.front();
+    ASSERT_NE(col, state.target_column);
 
-    EXPECT_TRUE(toggle_fix(state, "MISSING_VALUES"));
-    EXPECT_EQ(state.auto_fixes_applied.count("MISSING_VALUES"), 1u);
+    EXPECT_TRUE(toggle_excluded_column(state, col));
+    EXPECT_TRUE(is_excluded(state, col));
+    const auto opts = build_options(state, "/tmp/bundle");
+    ASSERT_EQ(opts.exclude_columns.size(), 1u);
+    EXPECT_EQ(opts.exclude_columns[0], col);
 
-    EXPECT_FALSE(toggle_fix(state, "MISSING_VALUES"));
-    EXPECT_EQ(state.auto_fixes_applied.count("MISSING_VALUES"), 0u);
+    EXPECT_FALSE(toggle_excluded_column(state, col));
+    EXPECT_FALSE(is_excluded(state, col));
+    EXPECT_TRUE(build_options(state, "/tmp/bundle").exclude_columns.empty());
 }
 
-TEST_F(WizardStateTest, ToggleFixIgnoresUnfixableCode) {
-    // The scanner emits codes (like TOO_FEW_ROWS) that can't be
-    // auto-fixed. Toggling those must be a no-op — the wizard UI
-    // won't render the checkbox, but test the guard anyway.
+TEST_F(WizardStateTest, TargetAndUnknownColumnsCannotBeExcluded) {
     set_csv(state, make_csv_meta());
-    set_dq_report(state, make_report(true, false));
-    EXPECT_FALSE(toggle_fix(state, "TOO_FEW_ROWS"));
-    EXPECT_TRUE(state.auto_fixes_applied.empty());
+    EXPECT_FALSE(toggle_excluded_column(state, state.target_column));
+    EXPECT_FALSE(toggle_excluded_column(state, "no_such_column"));
+    EXPECT_TRUE(state.excluded_columns.empty());
 }
 
-TEST_F(WizardStateTest, FixIsApplicableMatchesKnownCodes) {
-    neurograph::dataqc::Finding mv{};
-    mv.code = "MISSING_VALUES";
-    EXPECT_TRUE(fix_is_applicable(mv));
-
-    neurograph::dataqc::Finding tfr{};
-    tfr.code = "TOO_FEW_ROWS";
-    EXPECT_FALSE(fix_is_applicable(tfr));
+TEST_F(WizardStateTest, ChoosingAnExcludedColumnAsTargetBringsItBack) {
+    set_csv(state, make_csv_meta());
+    const std::string col = state.csv->columns.front();
+    ASSERT_TRUE(toggle_excluded_column(state, col));
+    ASSERT_TRUE(set_target_column(state, col));
+    EXPECT_FALSE(is_excluded(state, col));
 }
 
-TEST_F(WizardStateTest, SettingDqReportClearsPriorFixes) {
+TEST_F(WizardStateTest, TaskOverrideReachesTheOptionsAndClearsThePlan) {
     set_csv(state, make_csv_meta());
-    set_dq_report(state, make_report(false, true));
-    toggle_fix(state, "MISSING_VALUES");
-    ASSERT_FALSE(state.auto_fixes_applied.empty());
-
-    // Re-scanning produces a new report — fixes from the old one
-    // are stale and shouldn't carry over.
-    set_dq_report(state, make_report(false, true));
-    EXPECT_TRUE(state.auto_fixes_applied.empty());
+    state.column_plan.push_back({"a", "number", ""});
+    set_task_override(state, TaskOverride::Regression);
+    EXPECT_TRUE(state.column_plan.empty());
+    EXPECT_EQ(build_options(state, "/tmp").task,
+              neurograph::preprocess::TaskChoice::Regression);
+    set_task_override(state, TaskOverride::Classification);
+    EXPECT_EQ(build_options(state, "/tmp").task,
+              neurograph::preprocess::TaskChoice::Classification);
 }
 
 // ---------------------------------------------------------------------------
@@ -253,11 +252,16 @@ TEST_F(WizardStateTest, BuildOptionsReflectsPicks) {
     EXPECT_EQ(opts.bundle_out_dir, fs::path("/tmp/bundle"));
 }
 
-TEST_F(WizardStateTest, LearningCurveOnlyOnBestQuality) {
-    state.time_budget = TimeBudget::Balanced;
+TEST_F(WizardStateTest, LearningCurveExceptOnQuickAndLargerModelsOnBest) {
+    state.time_budget = TimeBudget::Quick;
     EXPECT_FALSE(build_options(state, "/tmp").do_learning_curve);
+    EXPECT_FALSE(build_options(state, "/tmp").thorough);
+    state.time_budget = TimeBudget::Balanced;
+    EXPECT_TRUE(build_options(state, "/tmp").do_learning_curve);
+    EXPECT_FALSE(build_options(state, "/tmp").thorough);
     state.time_budget = TimeBudget::Best;
     EXPECT_TRUE(build_options(state, "/tmp").do_learning_curve);
+    EXPECT_TRUE(build_options(state, "/tmp").thorough);
 }
 
 TEST_F(WizardStateTest, OnProgressStoresMostRecent) {
@@ -383,14 +387,14 @@ TEST_F(WizardStateTest, ResetToLoadClearsEverything) {
     set_csv(state, make_csv_meta());
     advance(state);
     set_dq_report(state, make_report(false, true));
-    toggle_fix(state, "MISSING_VALUES");
+    toggle_excluded_column(state, state.csv->columns.front());
 
     reset_to_load(state);
 
     EXPECT_EQ(state.current_step, WizardStep::Load);
     EXPECT_FALSE(state.csv.has_value());
     EXPECT_FALSE(state.dq_report.has_value());
-    EXPECT_TRUE(state.auto_fixes_applied.empty());
+    EXPECT_TRUE(state.excluded_columns.empty());
     EXPECT_TRUE(state.target_column.empty());
 }
 
@@ -398,7 +402,8 @@ TEST_F(WizardStateTest, ResetToTrainKeepsCsvButClearsResult) {
     set_csv(state, make_csv_meta());
     advance(state);
     set_dq_report(state, make_report(false, true));
-    toggle_fix(state, "MISSING_VALUES");
+    const std::string left_out = state.csv->columns.front();
+    toggle_excluded_column(state, left_out);
     advance(state);   // Train
     neurograph::orchestration::AutoResult r;
     r.summary_one_liner = "done";
@@ -410,7 +415,7 @@ TEST_F(WizardStateTest, ResetToTrainKeepsCsvButClearsResult) {
     EXPECT_EQ(state.current_step, WizardStep::Train);
     EXPECT_TRUE(state.csv.has_value());
     EXPECT_TRUE(state.dq_report.has_value());
-    EXPECT_EQ(state.auto_fixes_applied.count("MISSING_VALUES"), 1u);
+    EXPECT_TRUE(is_excluded(state, left_out));
     EXPECT_FALSE(state.result.has_value());
     EXPECT_EQ(state.status.load(), TrainingStatus::Idle);
 }

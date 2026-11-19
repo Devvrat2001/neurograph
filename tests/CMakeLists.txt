@@ -113,6 +113,7 @@ add_executable(neurograph_perf
     ${CMAKE_SOURCE_DIR}/src/workbench/wizard/step_quality.cpp
     ${CMAKE_SOURCE_DIR}/src/workbench/wizard/step_train.cpp
     ${CMAKE_SOURCE_DIR}/src/workbench/wizard/step_results.cpp
+    ${CMAKE_SOURCE_DIR}/src/workbench/wizard/native_dialogs.cpp
     ${NEUROGRAPH_CUDA_LINK_STUB}
 )
 
@@ -121,6 +122,10 @@ target_link_libraries(neurograph_perf PRIVATE
     GTest::gtest_main
     imgui::imgui   # P1-09 AC2: wizard render perf test needs ImGui
 )
+if(WIN32)
+    # The wizard's file dialogs (COM) and shell helpers.
+    target_link_libraries(neurograph_perf PRIVATE ole32 shell32 uuid)
+endif()
 
 # Wizard render headers live in src/workbench/wizard/. The perf test
 # includes "wizard_ui.hpp" with no relative qualifier (matches what
