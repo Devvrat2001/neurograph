@@ -93,6 +93,13 @@ public:
     Neuron replicate(double mutation_rate = 0.01) const;
 
     // --- Topology management ---
+    /// Forget every synapse reference. A neuron that is not yet part of a
+    /// network cannot have valid ones: Network::add_synapse is what creates
+    /// them.
+    void clear_synapse_links() {
+        outgoing_synapses_.clear();
+        incoming_synapses_.clear();
+    }
     void add_outgoing(SynapseId sid);
     void add_incoming(SynapseId sid);
     void remove_outgoing(const SynapseId& sid);

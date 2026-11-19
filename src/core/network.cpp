@@ -66,6 +66,11 @@ util::Result<NeuronId> Network::add_neuron(Neuron neuron) {
     if (neurons_.contains(id)) {
         return util::Error("Neuron already exists: " + id.value());
     }
+    // A neuron loaded from JSON carries the synapse ids it had when it was
+    // saved. Those synapses are added again right after (add_synapse appends
+    // to these same lists), so keeping the saved ids would list every
+    // connection twice and double every signal on the forward pass.
+    neuron.clear_synapse_links();
     adjacency_[id] = {};
     neurons_.emplace(id, std::move(neuron));
     NG_LOG_DEBUG("Added neuron: {}", id.value());
