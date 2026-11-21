@@ -115,9 +115,21 @@ Get-ChildItem $StagingDir | ForEach-Object { Write-Host ("      " + $_.Name) }
 # ---------------------------------------------------------------------------
 # 2. Make sure the WiX UI extension is registered for this user
 # ---------------------------------------------------------------------------
-Write-Host "==> Ensuring WixToolset.UI.wixext is installed" -ForegroundColor Cyan
-& wix extension add -g WixToolset.UI.wixext 2>&1 | Out-Null
-# Idempotent: if already added, wix prints a warning and returns 0.
+# The extension must match the WiX tool's version. Asked for without
+# one, `wix extension add` fetches the newest extension (7.x by late
+# 2026), which WiX 5 cannot load: a fresh machine such as a CI runner
+# then failed at `wix build`, while a machine that had added 5.x
+# earlier kept working. Idempotent: if already added, wix prints a
+# warning and returns 0.
+$WixVersionText = (& wix --version | Out-String).Trim()
+$WixVersion = ($WixVersionText -split '\+')[0]   # "5.0.2+aa65968c" -> "5.0.2"
+if ($WixVersion -notmatch '^\d+\.\d+\.\d+$') {
+  throw "Unexpected 'wix --version' output: '$WixVersionText'"
+}
+$UiExtension = "WixToolset.UI.wixext/$WixVersion"
+Write-Host "==> Ensuring $UiExtension is installed" -ForegroundColor Cyan
+& wix extension add -g $UiExtension
+if ($LASTEXITCODE -ne 0) { throw "Could not add $UiExtension (exit $LASTEXITCODE)" }
 
 # ---------------------------------------------------------------------------
 # 3. Build the MSI
@@ -129,7 +141,7 @@ $PdbPath = "$OutputDir\NeuroGraph-$Version.wixpdb"
 Write-Host "==> Building $MsiPath" -ForegroundColor Cyan
 & wix build `
     -arch x64 `
-    -ext WixToolset.UI.wixext `
+    -ext $UiExtension `
     -d "Version=$Version" `
     -d "Manufacturer=$Manufacturer" `
     -d "PayloadDir=$StagingDir" `
