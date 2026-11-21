@@ -98,13 +98,16 @@ jobs:
           # Debug leaves the perf target out entirely: defining it without
           # building it would make CTest register a failing placeholder.
           $perfFlag = if ("${{ matrix.config }}" -eq "Release") { "ON" } else { "OFF" }
+          # Keep the quotes around the values: PowerShell passes an
+          # unquoted -DNAME=$var to cmake as the literal text "$var",
+          # which CMake treats as true.
           cmake -S . -B build `
             -G "Visual Studio 17 2022" -A x64 `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=x64-windows `
             -DNEUROGRAPH_BUILD_TESTS=ON `
-            -DNEUROGRAPH_BUILD_PERF=$perfFlag `
-            -DNEUROGRAPH_ENABLE_COVERAGE=$covFlag
+            -DNEUROGRAPH_BUILD_PERF="$perfFlag" `
+            -DNEUROGRAPH_ENABLE_COVERAGE="$covFlag"
           if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
 
       - name: Build tests and tools
