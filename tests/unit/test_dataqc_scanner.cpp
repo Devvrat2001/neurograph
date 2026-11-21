@@ -219,6 +219,28 @@ TEST(DataQcScanner, HighCardinalityEmitsWarning) {
     EXPECT_EQ(f->column, "user_id");
 }
 
+TEST(DataQcScanner, ManyDifferentDatesAreNotFlagged) {
+    // A different date on every row is read as a date by the column plan,
+    // so the check must not say the column has too many values. The ID
+    // column next to it still gets the warning.
+    std::string body = "signed_up,user_id,label\n";
+    for (int i = 0; i < 200; ++i) {
+        char date[16];   // 200 different days, some with a time of day
+        std::snprintf(date, sizeof date, "2024-%02d-%02d", 1 + i / 28, 1 + i % 28);
+        body += std::string(date) + (i % 3 == 0 ? " 09:30" : "") + ",U" +
+                std::to_string(i) + "," + ((i % 2) ? "A" : "B") + "\n";
+    }
+    TempCsv csv("dates.csv", body);
+    const auto r = scan_csv(csv.path(), test_opts());
+    int flagged = 0;
+    for (const auto& f : r.findings) {
+        if (f.code != "HIGH_CARDINALITY") continue;
+        ++flagged;
+        EXPECT_EQ(f.column, "user_id");
+    }
+    EXPECT_EQ(flagged, 1);
+}
+
 TEST(DataQcScanner, ClassImbalanceWarnsAtBothLevels) {
     // 50 A + 4 B → ratio ~12.5 → WARN threshold (10) hit, ERROR (50) not.
     {

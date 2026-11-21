@@ -177,6 +177,14 @@ struct ColumnBuffer {
     std::vector<double> numeric_cache;
     static constexpr std::size_t max_numeric_cache = 200000;
 
+    // Of the first `date_sample` non-blank values, how many read as a date
+    // day-first and month-first. Enough to tell a date column, and cheap
+    // on large files.
+    static constexpr int date_sample = 10000;
+    int n_date_sampled = 0;
+    int n_date_dmy     = 0;
+    int n_date_mdy     = 0;
+
     void observe(std::string_view raw, int max_uniques_tracked) {
         const NumericParse p = try_parse_number(raw);
         if (p.is_missing) {
@@ -191,6 +199,13 @@ struct ColumnBuffer {
             }
         } else {
             ++n_categorical;
+        }
+        if (n_date_sampled < date_sample) {
+            ++n_date_sampled;
+            if (!p.parsed) {
+                if (util::try_parse_date(raw, true).parsed)  ++n_date_dmy;
+                if (util::try_parse_date(raw, false).parsed) ++n_date_mdy;
+            }
         }
 
         // Always track categories even for "numeric" strings so we can
@@ -221,6 +236,14 @@ bool column_is_numeric(const ColumnBuffer& b) {
     // 90%: strict enough to catch "mostly numeric with 3 typos" as mixed,
     // lenient enough to avoid downgrading real numeric columns for one bad row.
     return static_cast<double>(b.n_numeric) / non_missing >= 0.9;
+}
+
+// Mostly dates, by the same 90% rule the column plan uses. Such a column
+// is read as dates, so its many different values are expected.
+bool column_is_date(const ColumnBuffer& b) {
+    if (b.n_date_sampled == 0) return false;
+    const int n_date = std::max(b.n_date_dmy, b.n_date_mdy);
+    return static_cast<double>(n_date) / b.n_date_sampled >= 0.9;
 }
 
 // Finalize per-column stats into the public report format.
@@ -255,6 +278,15 @@ ColumnStats finalize_column(const ColumnBuffer& b, int top_k) {
     return cs;
 }
 
+// 4800 -> "4,800".
+std::string with_commas(long long n) {
+    std::string digits = std::to_string(n < 0 ? -n : n);
+    for (int i = static_cast<int>(digits.size()) - 3; i > 0; i -= 3) {
+        digits.insert(static_cast<std::size_t>(i), 1, ',');
+    }
+    return n < 0 ? "-" + digits : digits;
+}
+
 // Build the one-line human summary that headers the Data Health screen.
 std::string make_summary(const DataQualityReport& r) {
     const int n_err  = r.count_of(Severity::Error);
@@ -263,7 +295,7 @@ std::string make_summary(const DataQualityReport& r) {
     const int total  = n_err + n_warn + n_info;
 
     std::ostringstream oss;
-    oss << r.n_rows << " rows × " << r.n_cols << " cols, ";
+    oss << with_commas(r.n_rows) << " rows × " << with_commas(r.n_cols) << " columns, ";
 
     if (total == 0) {
         oss << "clean (no issues)";
@@ -531,7 +563,8 @@ void emit_findings(DataQualityReport& r, const CsvData& data,
         }
 
         // HIGH_CARDINALITY — categorical with > max(100, n_rows*0.5) uniques.
-        if (!is_numeric && !is_target) {
+        // Not for dates, which are read as dates whatever their number.
+        if (!is_numeric && !is_target && !column_is_date(col)) {
             const int threshold = std::max(100, n_rows / 2);
             if (col.cardinality_overflowed ||
                 static_cast<int>(col.category_counts.size()) > threshold) {

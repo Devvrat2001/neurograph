@@ -4,7 +4,7 @@ Train a prediction model from a CSV file on your own Windows PC: no Python,
 no cloud service, no data leaving the machine. Then use the model from the
 desktop app, the command line, or your own programs.
 
-> **Status:** 0.2, pre-release, Windows only. 483 unit and integration
+> **Status:** 0.2, pre-release, Windows only. 484 unit and integration
 > tests and 12 performance tests pass on a fresh checkout; two more run
 > only when the MNIST files are placed in `datasets/mnist`.
 
