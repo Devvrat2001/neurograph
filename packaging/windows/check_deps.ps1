@@ -13,7 +13,7 @@ if (-not $dumpbin) { throw "dumpbin.exe not found under VS 2022 installs" }
 $repoRoot = Resolve-Path "$PSScriptRoot\..\.."
 $bin      = Join-Path $repoRoot "build\Release"
 
-foreach ($f in @("neurograph_workbench.exe", "neurograph_predict.exe", "neurograph_rt.dll")) {
+foreach ($f in @("neurograph_workbench.exe", "neurograph_train.exe", "neurograph_predict.exe", "neurograph_rt.dll")) {
     Write-Host ""
     Write-Host "== $f ==" -ForegroundColor Cyan
     & $dumpbin.FullName /DEPENDENTS (Join-Path $bin $f) |

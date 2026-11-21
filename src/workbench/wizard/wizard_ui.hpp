@@ -13,11 +13,15 @@
 //   - If we ever swap from ImGui to a web UI, only this file has to
 //     be rewritten.
 //
-// Only consumed by `workbench_app.cpp`.
+// Used by `workbench_app.cpp`, the render perf test and the
+// wizard_snapshots tool, through the neurograph_workbench_ui library.
 
 #include "neurograph/workbench/wizard_state.hpp"
 
+#include <cstddef>
+#include <filesystem>
 #include <memory>
+#include <string>
 #include <thread>
 
 namespace neurograph::workbench {
@@ -37,6 +41,11 @@ struct WizardRuntime {
     // `joinable()` alone isn't enough because a finished thread is
     // still joinable until you call .join() on it.
     bool worker_active = false;
+
+    // A file dropped onto the window (WM_DROPFILES). The window procedure
+    // writes it; the Load step consumes and clears it on the next frame.
+    // Both run on the UI thread.
+    std::filesystem::path dropped_file;
 };
 
 /// Construct a fresh runtime. Moving requires manual work — the
@@ -58,5 +67,12 @@ void finalize_worker_if_done(WizardRuntime& rt, WizardState& state);
 /// Spawn a worker thread that invokes `orchestration::run` with the
 /// current wizard state. No-op when a worker is already active.
 void start_training(WizardState& state, WizardRuntime& rt);
+
+/// A count with thousands separators: 4800 -> "4,800".
+std::string with_commas(std::size_t n);
+
+/// Greyed-out explanatory text that wraps at the edge of the window
+/// (ImGui::TextDisabled runs past it).
+void text_hint(const std::string& text);
 
 } // namespace neurograph::workbench

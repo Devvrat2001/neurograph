@@ -10,11 +10,8 @@
 # the same runner that produced it (so we don't need to round-trip
 # the artifact through the cache before installing it).
 #
-# CUDA 12.4 is installed via Jimver/cuda-toolkit because the project's
-# CMakeLists declares CUDA as a first-class language (sm_86). The
-# runtime payload doesn't make any CUDA calls itself — the dependency
-# is link-time only via the static neurograph_cuda library — but that
-# still requires nvcc on PATH at build time.
+# No CUDA toolkit is needed: the shipped programs run on the CPU, and
+# the experimental GPU kernels are off by default (NEUROGRAPH_ENABLE_CUDA).
 
 name: release-windows
 
@@ -58,9 +55,9 @@ jobs:
     timeout-minutes: 90
 
     env:
-      # vcpkg manifest mode reads from vcpkg.json. Pinning the cache
-      # key to its hash means dep changes invalidate the cache cleanly.
-      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+      # Built vcpkg packages are cached in a plain folder saved by
+      # actions/cache (vcpkg's former x-gha provider no longer exists).
+      VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/vcpkg-binary-cache,readwrite"
       VCPKG_DEFAULT_TRIPLET: x64-windows
       CMAKE_BUILD_PARALLEL_LEVEL: "4"
 
@@ -97,23 +94,24 @@ jobs:
       - name: Set up MSBuild (VS 2022)
         uses: microsoft/setup-msbuild@v2
 
-      - name: Install CUDA Toolkit 12.4
-        uses: Jimver/cuda-toolkit@v0.2.16
-        id: cuda
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
         with:
-          cuda: "12.4.0"
-          # Slim install: just the bits needed to compile the kernels
-          # (no nsight, no docs, no samples). Saves ~3 GB.
-          sub-packages: '["nvcc", "cudart", "thrust", "visual_studio_integration"]'
-          method: "network"
+          path: ${{ github.workspace }}/vcpkg-binary-cache
+          key: vcpkg-bin-windows-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-bin-windows-
+
+      - name: Create vcpkg binary cache folder
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path "${{ github.workspace }}/vcpkg-binary-cache" | Out-Null
 
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11
         with:
-          # Pin to a vcpkg revision that ships a known-good imgui +
-          # libsodium combo. Update with care — manifest mode rebuilds
-          # everything when this changes.
-          vcpkgGitCommitId: "f33ad75da8d272e76dd685982f8ad862c6044f8e"
+          # vcpkg release 2026.10.16, the same commit as the
+          # builtin-baseline in vcpkg.json. Package versions are pinned
+          # there with "overrides".
+          vcpkgGitCommitId: "9eec002df1cd109f8f104cd966a763daf9751489"
 
       - name: Configure (CMake + vcpkg manifest)
         shell: pwsh
@@ -133,6 +131,7 @@ jobs:
           # binaries and the legacy `neurograph` CLI.
           cmake --build build --config Release --parallel `
             --target neurograph_workbench `
+            --target neurograph_train `
             --target neurograph_predict `
             --target neurograph_rt
           if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
@@ -154,7 +153,7 @@ jobs:
             -BuildDir "$pwd/build" `
             -Configuration Release `
             -Version "${{ steps.ver.outputs.msi_version }}" `
-            -Manufacturer "NeuroGraph Inc."
+            -Manufacturer "NeuroGraph"
 
       - name: Sign MSI
         shell: pwsh

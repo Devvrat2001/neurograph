@@ -36,6 +36,23 @@ std::string fmt_int(long long v) {
     return buf;
 }
 
+std::string fmt_seconds(double s) {
+    if (!(s > 0.0)) return "—";
+    char buf[48];
+    if (s < 10.0)       std::snprintf(buf, sizeof(buf), "%.1f s", s);
+    else if (s < 120.0) std::snprintf(buf, sizeof(buf), "%.0f s", s);
+    else                std::snprintf(buf, sizeof(buf), "%d min %d s",
+                                      static_cast<int>(s) / 60, static_cast<int>(s) % 60);
+    return buf;
+}
+
+// Last path component, split by hand: std::filesystem's narrow-string
+// conversion can throw on Windows for names outside the code page.
+std::string file_name_only(const std::string& p) {
+    const auto cut = p.find_last_of("/\\");
+    return cut == std::string::npos ? p : p.substr(cut + 1);
+}
+
 const char* impute_name(preprocess::ImputeStrategy s) {
     using S = preprocess::ImputeStrategy;
     switch (s) {
@@ -127,7 +144,16 @@ void render_training_data(std::ostringstream& out, const ModelCardInputs& in) {
     out << "- **Rows:** " << fmt_int(in.dq_report.n_rows) << "\n";
     out << "- **Columns:** " << fmt_int(in.dq_report.n_cols) << "\n";
     if (!in.dataset_path.empty()) {
-        out << "- **Path:** `" << in.dataset_path << "`\n";
+        out << "- **File:** `" << file_name_only(in.dataset_path) << "`\n";
+    }
+    if (in.n_train > 0) {
+        out << "- **Rows used:** " << fmt_int(in.n_train) << " to train, "
+            << fmt_int(in.n_val) << " to compare models and decide when to stop, "
+            << fmt_int(in.n_test) << " held back to measure the result\n";
+    }
+    if (in.rows_dropped_missing_target > 0) {
+        out << "- **Rows skipped (blank target):** "
+            << fmt_int(in.rows_dropped_missing_target) << "\n";
     }
     if (!std::isnan(in.dq_report.class_imbalance_ratio)) {
         out << "- **Class imbalance ratio:** "
@@ -159,7 +185,16 @@ void render_preprocessing(std::ostringstream& out, const ModelCardInputs& in) {
     out << "- **Split seed:** " << fmt_int(static_cast<long long>(in.pipe_config.split_seed))
         << "\n\n";
 
-    if (in.pipe_config.columns.empty()) {
+    if (!in.columns.empty()) {
+        h3(out, "Columns");
+        out << "| Column | Used as | Note |\n";
+        out << "|--------|---------|------|\n";
+        for (const auto& c : in.columns) {
+            out << "| `" << c.name << "` | " << c.role << " | "
+                << (c.note.empty() ? "—" : c.note) << " |\n";
+        }
+        out << "\n";
+    } else if (in.pipe_config.columns.empty()) {
         out << "_Per-column transforms were inferred automatically by the preprocessing scanner._\n\n";
     } else {
         h3(out, "Per-Column Transforms");
@@ -179,7 +214,60 @@ void render_preprocessing(std::ostringstream& out, const ModelCardInputs& in) {
     }
 }
 
+void render_model_selection(std::ostringstream& out, const ModelCardInputs& in) {
+    h2(out, "Training Procedure");
+    out << "Several kinds of model were trained on the same rows. Each was "
+           "checked on rows it had not learned from, and the one with the "
+           "lowest error there was kept.\n\n";
+    if (!in.model_description.empty()) {
+        out << "- **Chosen model:** " << in.model_description << "\n";
+        if (!in.model_choice_reason.empty()) {
+            out << "- **Why:** " << in.model_choice_reason << "\n";
+        }
+        out << "\n";
+    }
+    const bool cls = (in.task_kind == "classification");
+    out << "| Model | " << (cls ? "Accuracy" : "R²")
+        << " on check rows | Training time | Detail |\n";
+    out << "|-------|---------------------|---------------|--------|\n";
+    for (const auto& c : in.candidates) {
+        out << "| " << (c.chosen ? "**" + c.name + "** (chosen)" : c.name)
+            << " | " << (cls ? fmt_pct(c.val_score) : fmt_num(c.val_score))
+            << " | " << fmt_seconds(c.seconds)
+            << (c.stopped_by_time ? " (hit time limit)" : "")
+            << " | " << (c.detail.empty() ? "—" : c.detail) << " |\n";
+    }
+    out << "\n";
+}
+
+void render_importance(std::ostringstream& out, const ModelCardInputs& in) {
+    if (in.importance.empty()) return;
+    h2(out, "What the Model Relies On");
+    out << "Each column's values were shuffled between rows, one column at a "
+           "time, to see how much worse the model does without it. Columns "
+           "near the top matter most.\n\n";
+    const bool cls = (in.task_kind == "classification");
+    out << "| Column | Relative importance | " << (cls ? "Accuracy lost" : "R² lost")
+        << " |\n";
+    out << "|--------|---------------------|------|\n";
+    constexpr std::size_t kMaxRows = 20;
+    for (std::size_t i = 0; i < in.importance.size() && i < kMaxRows; ++i) {
+        const auto& m = in.importance[i];
+        out << "| `" << m.column << "` | " << fmt_num(m.relative, 2) << " | "
+            << (cls ? fmt_pct(m.score_drop, 1) : fmt_num(m.score_drop, 3)) << " |\n";
+    }
+    if (in.importance.size() > kMaxRows) {
+        out << "\n_" << fmt_int(static_cast<long long>(in.importance.size() - kMaxRows))
+            << " more columns have less influence._\n";
+    }
+    out << "\n";
+}
+
 void render_training_procedure(std::ostringstream& out, const ModelCardInputs& in) {
+    if (!in.candidates.empty()) {
+        render_model_selection(out, in);
+        return;
+    }
     const auto& tc = in.train_config;
     const auto& oc = tc.optimizer_config;
 
@@ -329,9 +417,17 @@ void render_limitations(std::ostringstream& out, const ModelCardInputs& in) {
         out << "- The learning-curve verdict is **Improving**: collecting more "
                "training data is likely to raise the headline metric further.\n";
     }
-    if (in.baseline.lift_vs_best_baseline <= 0.0 && !in.baseline.baselines.empty()) {
-        out << "- The model does not currently outperform a trivial baseline. "
-               "Re-evaluate features and architecture before relying on its output.\n";
+    const bool cls = (in.task_kind == "classification");
+    if (in.baseline.lift_vs_trivial <= 0.0 && !in.baseline.baselines.empty()) {
+        out << "- The model does not currently outperform a trivial baseline on "
+            << (cls ? "accuracy" : "R²")
+            << ". Re-evaluate the columns before relying on its output.\n";
+    }
+    const int n_scored = (in.n_test > 0) ? in.n_test : in.n_val;
+    if (in.n_train > 0 && n_scored > 0 && n_scored < 100) {
+        out << "- The scores come from only " << fmt_int(n_scored)
+            << " held-back rows, so they are rough: on new data they could be "
+               "several points higher or lower.\n";
     }
     out << "\n";
 }
@@ -361,6 +457,9 @@ std::string render_model_card(const ModelCardInputs& in) {
     render_training_procedure(out, in);
 
     h2(out, "Evaluation");
+    if (!in.evaluated_on.empty()) {
+        out << "Measured on " << in.evaluated_on << ".\n\n";
+    }
     if (in.task_kind == "classification" && in.cls_metrics) {
         render_classification_metrics(out, *in.cls_metrics);
     } else if (in.task_kind == "regression" && in.reg_metrics) {
@@ -369,6 +468,7 @@ std::string render_model_card(const ModelCardInputs& in) {
         out << "_No evaluation metrics were attached to this report._\n\n";
     }
 
+    render_importance(out, in);
     render_baseline(out, in.baseline);
     render_curve(out, in.curve);
     render_limitations(out, in);

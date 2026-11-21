@@ -34,6 +34,7 @@
 
 #include "neurograph/dataqc/report.hpp"
 #include "neurograph/orchestration/auto_pipeline.hpp"
+#include "neurograph/preprocess/pipeline.hpp"
 #include "neurograph/util/result.hpp"
 
 #include <atomic>
@@ -41,8 +42,8 @@
 #include <filesystem>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
-#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -56,17 +57,18 @@ enum class WizardStep {
     Results  = 3,
 };
 
-/// User-facing time budget knob. Maps to concrete seconds via
-/// `time_budget_seconds` — the wizard never asks for raw seconds.
+/// User-facing time allowance. Maps to seconds via `time_budget_seconds`.
+/// These are upper limits: each model stops on its own once it stops
+/// improving, so small files finish in seconds whatever is picked.
 enum class TimeBudget {
-    Quick    = 0,   // ≤ 30  s — for smoke / demos
-    Balanced = 1,   // ≤ 300 s — default
-    Best     = 2,   // ≤ 1800 s — "let it cook"
+    Quick    = 0,   // up to 30 s, no learning curve
+    Balanced = 1,   // up to 5 min (default)
+    Best     = 2,   // up to 30 min, also tries larger models
 };
 
-/// Task-kind override. Auto lets the scanner decide, the other two
-/// force the path. Non-auto is rarely correct — there's a warning
-/// next to the picker in the UI for that reason.
+/// Task-kind override. Auto decides from the target column (text or a
+/// few whole numbers: categories; otherwise a number). The other two
+/// force it; the pipeline refuses to treat text as a number.
 enum class TaskOverride {
     Auto           = 0,
     Classification = 1,
@@ -117,10 +119,15 @@ struct WizardState {
 
     // Step 2 — Data Quality ---------------------------------------------
     std::optional<dataqc::DataQualityReport> dq_report;
-    /// Set of finding codes (e.g. "MISSING_VALUES") the user has
-    /// ticked "Fix automatically" for. The orchestrator reads these
-    /// to decide which pipeline transforms to insert.
-    std::unordered_set<std::string>          auto_fixes_applied;
+
+    /// What the pipeline will do with each column (used / left out and
+    /// why), for the current file, target and task. Empty until the
+    /// Quality step computes it; cleared when any of those change.
+    std::vector<preprocess::ColumnDecision>  column_plan;
+    std::string                              column_plan_error;
+
+    /// Columns the user chose to leave out of the model.
+    std::set<std::string>                    excluded_columns;
 
     // Step 3 — Train -----------------------------------------------------
     TimeBudget      time_budget    = TimeBudget::Balanced;
@@ -170,9 +177,9 @@ struct WizardState {
 // ---------------------------------------------------------------------------
 
 /// Is it legal for the user to click "Next" right now? Returns an
-/// empty string when yes, otherwise a reason string to surface next to
-/// the disabled button ("Pick a target column", "Fix the blocking
-/// data quality error", etc.). Never returns nullptr.
+/// empty string when yes, otherwise the reason, which the wizard shows
+/// next to the disabled button ("Choose a CSV file to continue.", "Fix
+/// the blocking problem to continue.", etc.).
 std::string can_advance(const WizardState& s);
 
 /// Move to the next step if `can_advance` would allow. Returns true
@@ -219,18 +226,20 @@ std::string default_target_column(const CsvMetadata& meta);
 // Step 2 — Data quality helpers
 // ---------------------------------------------------------------------------
 
-/// Attach a quality report. Clears previously-applied fixes — they're
-/// stale against the new report.
+/// Attach a quality report.
 void set_dq_report(WizardState& s, dataqc::DataQualityReport report);
 
-/// True when a given finding has a registered "automatic fix" the
-/// preprocessor knows how to apply. Anything else needs the user to
-/// edit the CSV externally.
-bool fix_is_applicable(const dataqc::Finding& f);
+/// Leave a column out of the model, or put it back. The target cannot
+/// be left out; returns false (and changes nothing) for it or for a
+/// name that is not in the file. Otherwise returns the new state:
+/// true = left out.
+bool toggle_excluded_column(WizardState& s, const std::string& column);
 
-/// Toggle a fix on/off. Ignored when the finding has no applicable
-/// fix. Returns the new state (true = applied, false = not applied).
-bool toggle_fix(WizardState& s, const std::string& finding_code);
+bool is_excluded(const WizardState& s, const std::string& column);
+
+/// Choose classification / regression / automatic. Clears the column
+/// plan, which depends on it.
+void set_task_override(WizardState& s, TaskOverride t);
 
 /// Does the report contain any Error-severity finding? The UI uses
 /// this to disable the Next button with a blocking-error message.

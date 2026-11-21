@@ -45,9 +45,9 @@ For each VM image (Win10 + Win11):
 2. [ ] Copy `NeuroGraph-<version>.msi` from a release artifact to the
        VM (drag-drop, shared folder, or scp).
 3. [ ] Right-click the MSI → **Install**. Confirm:
-       - SmartScreen prompt names **"Publisher: NeuroGraph Inc."**
-         (signed builds only — unsigned dev builds will warn "Unknown
-         Publisher" and that's expected; note in sign-off).
+       - SmartScreen prompt names the publisher on the signing
+         certificate (signed builds only — unsigned dev builds will warn
+         "Unknown Publisher" and that's expected; note in sign-off).
        - Installer chooses default install dir `C:\Program Files\NeuroGraph`.
        - Finish completes without errors.
 4. [ ] Verify install dir contents — at minimum:

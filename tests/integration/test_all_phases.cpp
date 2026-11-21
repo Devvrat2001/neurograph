@@ -531,8 +531,8 @@ TEST(Phase2, DataLoaderImageResize) {
 
 TEST(Phase2, MNISTLoaderExists) {
     // Verify MNIST files exist from earlier download
-    std::string img_path = "C:/Users/maind/OneDrive/Documents/project/neurograph/datasets/mnist/train-images-idx3-ubyte";
-    std::string lbl_path = "C:/Users/maind/OneDrive/Documents/project/neurograph/datasets/mnist/train-labels-idx1-ubyte";
+    std::string img_path = NEUROGRAPH_SOURCE_DIR "/datasets/mnist/train-images-idx3-ubyte";
+    std::string lbl_path = NEUROGRAPH_SOURCE_DIR "/datasets/mnist/train-labels-idx1-ubyte";
 
     if (std::filesystem::exists(img_path) && std::filesystem::exists(lbl_path)) {
         auto result = DataLoader::load_mnist_idx(img_path, lbl_path, 100);
@@ -562,7 +562,7 @@ TEST(Phase3, LRFinderSmallNetwork) {
     TrainingEngine engine(net);
 
     // Load iris dataset
-    std::string iris_path = "C:/Users/maind/OneDrive/Documents/project/neurograph/datasets/iris.csv";
+    std::string iris_path = NEUROGRAPH_SOURCE_DIR "/datasets/iris.csv";
     if (!std::filesystem::exists(iris_path)) {
         GTEST_SKIP() << "Iris dataset not found";
     }
@@ -594,7 +594,7 @@ TEST(Phase3, MetricsExportCSV) {
         history.push_back(r);
     }
 
-    std::string path = "C:/Users/maind/OneDrive/Documents/project/neurograph/build/test_metrics.csv";
+    std::string path = NEUROGRAPH_BINARY_DIR "/test_metrics.csv";
     EXPECT_NO_THROW(MetricsExporter::export_csv(path, history));
     EXPECT_TRUE(std::filesystem::exists(path));
 
@@ -625,7 +625,7 @@ TEST(Phase3, MetricsExportJSON) {
     r.val_loss = 1.6; r.val_accuracy = 0.78; r.epoch_duration_ms = 50;
     history.push_back(r);
 
-    std::string path = "C:/Users/maind/OneDrive/Documents/project/neurograph/build/test_metrics.json";
+    std::string path = NEUROGRAPH_BINARY_DIR "/test_metrics.json";
     EXPECT_NO_THROW(MetricsExporter::export_json(path, history, "test_model", "test_data"));
     EXPECT_TRUE(std::filesystem::exists(path));
 
@@ -653,7 +653,7 @@ TEST(Phase3, MetricsTimestampedName) {
 // ============================================================
 
 TEST(Integration, IrisTrainingWithAllFeatures) {
-    std::string iris_path = "C:/Users/maind/OneDrive/Documents/project/neurograph/datasets/iris.csv";
+    std::string iris_path = NEUROGRAPH_SOURCE_DIR "/datasets/iris.csv";
     if (!std::filesystem::exists(iris_path)) {
         GTEST_SKIP() << "Iris dataset not found";
     }
@@ -710,8 +710,8 @@ TEST(Integration, IrisTrainingWithAllFeatures) {
 }
 
 TEST(Integration, MNISTSmallTraining) {
-    std::string img_path = "C:/Users/maind/OneDrive/Documents/project/neurograph/datasets/mnist/train-images-idx3-ubyte";
-    std::string lbl_path = "C:/Users/maind/OneDrive/Documents/project/neurograph/datasets/mnist/train-labels-idx1-ubyte";
+    std::string img_path = NEUROGRAPH_SOURCE_DIR "/datasets/mnist/train-images-idx3-ubyte";
+    std::string lbl_path = NEUROGRAPH_SOURCE_DIR "/datasets/mnist/train-labels-idx1-ubyte";
 
     if (!std::filesystem::exists(img_path) || !std::filesystem::exists(lbl_path)) {
         GTEST_SKIP() << "MNIST files not found";

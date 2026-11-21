@@ -1,6 +1,7 @@
 #include "neurograph/runtime/bundle.hpp"
 
 #include "neurograph/core/network.hpp"
+#include "neurograph/models/model.hpp"
 #include "neurograph/snapshot/snapshot_metadata.hpp"
 #include "neurograph/training/backprop.hpp"
 #include "neurograph/training/io_manager.hpp"
@@ -64,7 +65,8 @@ constexpr const char* kBundleManifest = "manifest.json";
 // The orchestrator currently writes v2 for the main Training stage;
 // v1 still loads for backwards compat with anything packaged earlier.
 constexpr int kModelSchemaVersionMin = 1;
-constexpr int kModelSchemaVersionMax = 2;
+//   v3 — native model chosen by the automatic trainer (kind names the family)
+constexpr int kModelSchemaVersionMax = 3;
 
 // Read a file into a string. On failure returns nullopt; the caller
 // shapes the error message so it can name the missing file.
@@ -178,7 +180,40 @@ std::string ModelBundle::class_label(int i) const {
         if (i < 0 || i >= static_cast<int>(m->class_labels.size())) return {};
         return m->class_labels[i];
     }
+    if (const auto* m = std::get_if<NativeModel>(&model)) {
+        if (i < 0 || i >= static_cast<int>(m->class_labels.size())) return {};
+        return m->class_labels[i];
+    }
     return {};
+}
+
+int ModelBundle::n_features() const noexcept {
+    if (const auto* m = std::get_if<LinearClassificationModel>(&model))    return m->n_features;
+    if (const auto* m = std::get_if<LinearRegressionModel>(&model))        return m->n_features;
+    if (const auto* m = std::get_if<NeuralNetClassificationModel>(&model)) return m->n_features;
+    if (const auto* m = std::get_if<NeuralNetRegressionModel>(&model))     return m->n_features;
+    if (const auto* m = std::get_if<NativeModel>(&model))                  return m->n_features;
+    return 0;
+}
+
+std::string ModelBundle::description() const {
+    if (const auto* m = std::get_if<NativeModel>(&model)) {
+        if (m->impl) return m->impl->describe();
+    }
+    return {};
+}
+
+std::vector<std::string>
+missing_input_columns(const ModelBundle& bundle,
+                      const std::vector<std::string>& header) {
+    std::vector<std::string> missing;
+    if (!bundle.pipeline) return missing;
+    for (const auto& need : bundle.pipeline->input_columns()) {
+        if (std::find(header.begin(), header.end(), need) == header.end()) {
+            missing.push_back(need);
+        }
+    }
+    return missing;
 }
 
 // ---------------------------------------------------------------------------
@@ -232,7 +267,43 @@ util::Result<ModelBundle> load_bundle(const fs::path& dir) {
     bundle.pipeline   = std::move(pipe);
     bundle.source_dir = dir;
 
-    if (kind == "classification") {
+    if (sv >= 3) {
+        NativeModel nm;
+        try {
+            nm.impl = std::shared_ptr<const models::Model>(
+                models::model_from_json(mj.at("model")));
+            nm.class_labels = mj.value("class_labels", std::vector<std::string>{});
+        } catch (const std::exception& e) {
+            return util::Error(std::string("bundle: model.ngm: ") + e.what());
+        }
+        // The top-level kind must name the model actually stored, so a
+        // file edited by hand (or from a newer version) is refused rather
+        // than half-understood.
+        if (kind != nm.impl->kind()) {
+            return util::Error("bundle: model.ngm has unknown kind '" + kind +
+                               "' (its model section is '" +
+                               std::string(nm.impl->kind()) + "')");
+        }
+        nm.n_features = nm.impl->n_features();
+        nm.n_classes  = (nm.impl->task() == models::Task::Classification)
+                      ? nm.impl->n_outputs() : 0;
+        if (nm.n_classes > 0
+            && static_cast<int>(nm.class_labels.size()) != nm.n_classes) {
+            return util::Error("bundle: model.ngm lists " +
+                               std::to_string(nm.class_labels.size()) +
+                               " class labels but the model has " +
+                               std::to_string(nm.n_classes) + " classes");
+        }
+        const std::size_t pipe_width = bundle.pipeline->feature_names_out().size();
+        if (static_cast<std::size_t>(nm.n_features) != pipe_width) {
+            return util::Error("bundle: the model takes " +
+                               std::to_string(nm.n_features) +
+                               " inputs but pipeline.ngpipe produces " +
+                               std::to_string(pipe_width) +
+                               " (the two files are from different training runs)");
+        }
+        bundle.model = std::move(nm);
+    } else if (kind == "classification") {
         // schema_v1 linear probe — kept for backwards compat with older bundles.
         auto r = parse_classification_model(mj);
         if (!r.ok()) return util::Error(r.error().message);
@@ -307,67 +378,7 @@ Prediction predict_row(const ModelBundle& bundle, const nlohmann::json& row) {
         return out;
     }
 
-    if (const auto* m = std::get_if<LinearClassificationModel>(&bundle.model)) {
-        if (m->n_classes < 2) return out;
-        std::vector<double> z(m->n_classes, 0.0);
-        const std::size_t D = std::min(x.size(),
-                                       static_cast<std::size_t>(m->n_features));
-        for (int k = 0; k < m->n_classes; ++k) {
-            double s = m->b[k];
-            for (std::size_t d = 0; d < D; ++d) s += m->W[k][d] * x[d];
-            z[k] = s;
-        }
-        softmax_inplace(z);
-        out.predicted_class = argmax_(z);
-        out.probabilities   = std::move(z);
-    } else if (const auto* mr = std::get_if<LinearRegressionModel>(&bundle.model)) {
-        double yhat = mr->bias;
-        const std::size_t D = std::min(x.size(),
-                                       static_cast<std::size_t>(mr->n_features));
-        for (std::size_t d = 0; d < D; ++d) yhat += mr->w[d] * x[d];
-        out.value = yhat;
-    } else if (const auto* nc = std::get_if<NeuralNetClassificationModel>(&bundle.model)) {
-        // SON neural net forward pass. Backprop owns the topo order
-        // and IOManager scratch buffers; we just feed in `x` (already
-        // pipeline-normalized) and read the output activations, then
-        // softmax to a probability distribution.
-        if (!nc->state || !nc->state->bp || !nc->state->io) return out;
-        // Pad / truncate features to match the trained input width so
-        // a row with an extra column doesn't blow up the forward pass.
-        std::vector<double> x_padded(nc->n_features, 0.0);
-        const std::size_t D = std::min(x.size(),
-                                       static_cast<std::size_t>(nc->n_features));
-        for (std::size_t d = 0; d < D; ++d) x_padded[d] = x[d];
-
-        // P1-15 + ASan finding: serialize forward calls — Backprop's
-        // internal state mutates per call, concurrent races caused
-        // double-free in CapiTest.ConcurrentPredictIsSafeAndDeterministic.
-        std::vector<double> z;
-        {
-            std::lock_guard<std::mutex> lk(nc->state->forward_mutex);
-            nc->state->bp->forward(x_padded);
-            z = nc->state->io->read_outputs();
-        }
-        if (z.empty()) return out;
-        softmax_inplace(z);
-        out.predicted_class = argmax_(z);
-        out.probabilities   = std::move(z);
-    } else if (const auto* nr = std::get_if<NeuralNetRegressionModel>(&bundle.model)) {
-        if (!nr->state || !nr->state->bp || !nr->state->io) return out;
-        std::vector<double> x_padded(nr->n_features, 0.0);
-        const std::size_t D = std::min(x.size(),
-                                       static_cast<std::size_t>(nr->n_features));
-        for (std::size_t d = 0; d < D; ++d) x_padded[d] = x[d];
-
-        std::vector<double> z;
-        {
-            std::lock_guard<std::mutex> lk(nr->state->forward_mutex);
-            nr->state->bp->forward(x_padded);
-            z = nr->state->io->read_outputs();
-        }
-        out.value = z.empty() ? 0.0 : z[0];
-    }
-    return out;
+    return predict_vec(bundle, x);
 }
 
 // ---------------------------------------------------------------------------
@@ -379,6 +390,25 @@ Prediction predict_row(const ModelBundle& bundle, const nlohmann::json& row) {
 Prediction predict_vec(const ModelBundle& bundle,
                        const std::vector<double>& x) {
     Prediction out;
+
+    if (const auto* nm = std::get_if<NativeModel>(&bundle.model)) {
+        if (!nm->impl) return out;
+        // Pad / truncate so a caller-supplied vector of the wrong width
+        // cannot read out of bounds.
+        std::vector<double> xin(static_cast<std::size_t>(nm->n_features), 0.0);
+        std::copy_n(x.begin(), std::min(x.size(), xin.size()), xin.begin());
+        if (nm->n_classes >= 2) {
+            std::vector<double> p(static_cast<std::size_t>(nm->n_classes), 0.0);
+            nm->impl->predict(xin.data(), p.data());
+            out.predicted_class = argmax_(p);
+            out.probabilities   = std::move(p);
+        } else {
+            double y = 0.0;
+            nm->impl->predict(xin.data(), &y);
+            out.value = y;
+        }
+        return out;
+    }
 
     if (const auto* m = std::get_if<LinearClassificationModel>(&bundle.model)) {
         if (m->n_classes < 2) return out;

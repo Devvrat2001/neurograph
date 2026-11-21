@@ -122,3 +122,4 @@ trial_state.json
 # is belt-and-suspenders.)
 tmp/
 .tmp/
+bench-data/

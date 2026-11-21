@@ -261,13 +261,32 @@ LinearProbeFitReg linear_probe_regression(
 }
 
 // ---------------------------------------------------------------------------
-// Verdict — exact strings come from the spec; keep verbatim.
+// Verdict.
+//
+// `reduction` is the share of the trivial baseline's error the model
+// removes: (score − trivial) / (1 − trivial) for accuracy and R², and for
+// classification also 1 − log-loss / log-loss of the class frequencies,
+// whichever is larger. The second form matters on imbalanced data, where
+// a useful model can have the same accuracy as "always say no" while its
+// probabilities are far better.
 // ---------------------------------------------------------------------------
-std::string make_verdict(double lift) {
-    if (lift > 0.15) return "Strong result — model is substantially better than simple baselines.";
-    if (lift > 0.05) return "Good result — model beats baselines by a meaningful margin.";
-    if (lift > 0.0)  return "Marginal — model is only slightly better than guessing. Consider more data or features.";
-    return "⚠ Model is not learning — it performs no better than a trivial baseline.";
+constexpr const char* kNoEvalRows =
+    "Cannot evaluate — no rows were held back for checking.";
+constexpr const char* kOneClass =
+    "Cannot evaluate — the held-back rows all have the same class.";
+
+std::string make_verdict(bool learned, double reduction, bool linear_is_enough) {
+    if (!learned) {
+        return "⚠ Model is not learning — it performs no better than a trivial baseline.";
+    }
+    std::string v;
+    if (reduction >= 0.5)      v = "Strong result — model is substantially better than simple baselines.";
+    else if (reduction >= 0.2) v = "Good result — model beats baselines by a meaningful margin.";
+    else                       v = "Marginal — model is only slightly better than guessing. Consider more data or features.";
+    if (linear_is_enough) {
+        v += " A straight-line model scores about the same, so the pattern in this data is mostly linear.";
+    }
+    return v;
 }
 
 // Compute (primary, secondary) for a classification baseline given its
@@ -292,43 +311,58 @@ std::pair<double, double> reg_metrics(const std::vector<double>& y_true,
 } // namespace
 
 // ---------------------------------------------------------------------------
-// Public entry point
+// Public entry points
 // ---------------------------------------------------------------------------
 BaselineReport compare_to_baselines(
     const preprocess::TransformedDataset&    ds,
     const std::vector<std::vector<double>>&  model_val_preds,
     bool                                     is_classification,
     std::uint64_t                            seed) {
+    return compare_to_baselines(ds.X_train, ds.y_train, ds.X_val, ds.y_val,
+                                model_val_preds, is_classification, seed);
+}
+
+BaselineReport compare_to_baselines(
+    const std::vector<std::vector<double>>&  X_train,
+    const std::vector<std::vector<double>>&  y_train_rows,
+    const std::vector<std::vector<double>>&  X_eval,
+    const std::vector<std::vector<double>>&  y_eval_rows,
+    const std::vector<std::vector<double>>&  model_eval_preds,
+    bool                                     is_classification,
+    std::uint64_t                            seed) {
 
     BaselineReport report;
 
-    // Sanity: empty val set is a hard stop, no baselines computable.
-    if (ds.X_val.empty() || ds.y_val.empty()) {
-        report.verdict = "Cannot evaluate — val set is empty.";
+    // Nothing to score on: no baselines computable.
+    if (X_eval.empty() || y_eval_rows.empty()) {
+        report.verdict = kNoEvalRows;
         return report;
     }
 
+    double trivial_best  = -std::numeric_limits<double>::infinity();
+    double probe_primary = std::numeric_limits<double>::quiet_NaN();
+    double ll_reduction  = 0.0;     // classification only
+
     if (is_classification) {
-        const int n_classes = ds.y_val.front().empty()
+        const int n_classes = y_eval_rows.front().empty()
                             ? 0
-                            : static_cast<int>(ds.y_val.front().size());
+                            : static_cast<int>(y_eval_rows.front().size());
         if (n_classes < 2) {
-            report.verdict = "Cannot evaluate — val set has only one class.";
+            report.verdict = kOneClass;
             return report;
         }
 
-        const auto y_val_idx   = argmax_rows(ds.y_val);
-        const auto y_train_idx = argmax_rows(ds.y_train);
-        const auto train_counts = class_counts(ds.y_train, n_classes);
+        const auto y_val_idx    = argmax_rows(y_eval_rows);
+        const auto y_train_idx  = argmax_rows(y_train_rows);
+        const auto train_counts = class_counts(y_train_rows, n_classes);
 
-        // Single-class val set: every val row has the same target. Metrics
-        // (especially F1) become degenerate / NaN. Bail with the dedicated
-        // verdict so the wizard surfaces a clear message.
+        // Every held-back row has the same class: accuracy and F1 are
+        // degenerate. Say so instead of reporting NaNs.
         const bool val_single_class = std::all_of(
             y_val_idx.begin() + 1, y_val_idx.end(),
             [&](int x) { return x == y_val_idx.front(); });
         if (val_single_class) {
-            report.verdict = "Cannot evaluate — val set has only one class.";
+            report.verdict = kOneClass;
             return report;
         }
 
@@ -337,7 +371,7 @@ BaselineReport compare_to_baselines(
             std::distance(train_counts.begin(),
                           std::max_element(train_counts.begin(), train_counts.end())));
         std::vector<std::vector<double>> majority_probs(
-            ds.X_val.size(), one_hot(majority, n_classes));
+            X_eval.size(), one_hot(majority, n_classes));
         BaselineResult maj;
         maj.name = "majority";
         std::tie(maj.primary_metric, maj.secondary_metric) =
@@ -356,8 +390,8 @@ BaselineReport compare_to_baselines(
         }
         std::mt19937_64 rng(seed);
         std::discrete_distribution<int> dist(prior.begin(), prior.end());
-        std::vector<std::vector<double>> random_probs(ds.X_val.size());
-        for (std::size_t i = 0; i < ds.X_val.size(); ++i) {
+        std::vector<std::vector<double>> random_probs(X_eval.size());
+        for (std::size_t i = 0; i < X_eval.size(); ++i) {
             random_probs[i] = one_hot(dist(rng), n_classes);
         }
         BaselineResult rnd;
@@ -368,7 +402,7 @@ BaselineReport compare_to_baselines(
 
         // --- Linear probe ---
         const auto probe = linear_probe_classification(
-            ds.X_train, y_train_idx, ds.X_val, n_classes);
+            X_train, y_train_idx, X_eval, n_classes);
         BaselineResult lin;
         lin.name = "linear_probe";
         std::tie(lin.primary_metric, lin.secondary_metric) =
@@ -377,12 +411,31 @@ BaselineReport compare_to_baselines(
 
         // --- Model ---
         std::tie(report.model_primary, report.model_secondary) =
-            cls_metrics(y_val_idx, model_val_preds, n_classes);
+            cls_metrics(y_val_idx, model_eval_preds, n_classes);
+
+        trivial_best  = std::max(maj.primary_metric, rnd.primary_metric);
+        probe_primary = lin.primary_metric;
+
+        // Log-loss of the model against log-loss of always answering with
+        // the training class frequencies (smoothed so no class gets 0).
+        double ll_model = 0.0, ll_prior = 0.0;
+        for (std::size_t i = 0; i < y_val_idx.size(); ++i) {
+            const int y = y_val_idx[i];
+            const double p_model =
+                (i < model_eval_preds.size() && y >= 0
+                 && y < static_cast<int>(model_eval_preds[i].size()))
+                    ? model_eval_preds[i][y] : 0.0;
+            const double p_prior =
+                (static_cast<double>(train_counts[y]) + 1.0) / (total + n_classes);
+            ll_model += -std::log(std::max(p_model, 1e-12));
+            ll_prior += -std::log(std::max(p_prior, 1e-12));
+        }
+        if (ll_prior > 1e-12) ll_reduction = 1.0 - ll_model / ll_prior;
 
     } else {
-        const auto y_val   = flatten_scalar(ds.y_val);
-        const auto y_train = flatten_scalar(ds.y_train);
-        const auto y_pred  = flatten_scalar(model_val_preds);
+        const auto y_val   = flatten_scalar(y_eval_rows);
+        const auto y_train = flatten_scalar(y_train_rows);
+        const auto y_pred  = flatten_scalar(model_eval_preds);
 
         const auto stats = mean_std(y_train);
 
@@ -404,7 +457,7 @@ BaselineReport compare_to_baselines(
         report.baselines.push_back(r);
 
         // --- Linear probe ---
-        const auto probe = linear_probe_regression(ds.X_train, y_train, ds.X_val);
+        const auto probe = linear_probe_regression(X_train, y_train, X_eval);
         BaselineResult l;
         l.name = "linear_probe";
         std::tie(l.primary_metric, l.secondary_metric) = reg_metrics(y_val, probe.y_eval_pred);
@@ -412,21 +465,36 @@ BaselineReport compare_to_baselines(
 
         // --- Model ---
         std::tie(report.model_primary, report.model_secondary) = reg_metrics(y_val, y_pred);
+
+        trivial_best  = std::max(m.primary_metric, r.primary_metric);
+        probe_primary = l.primary_metric;
     }
 
-    // --- Lift + verdict ---
+    // --- Lift over every baseline, the probe included ---
     double best_baseline = -std::numeric_limits<double>::infinity();
     for (const auto& b : report.baselines) {
-        // R² and accuracy can be negative (R²) or in [0,1] (accuracy). Use
-        // them at face value — anything negative for R² is "worse than
-        // mean" so it correctly never wins the max.
+        // R² can be negative; anything below zero is "worse than the mean"
+        // and correctly never wins the max.
         if (std::isfinite(b.primary_metric) && b.primary_metric > best_baseline) {
             best_baseline = b.primary_metric;
         }
     }
     if (!std::isfinite(best_baseline)) best_baseline = 0.0;
     report.lift_vs_best_baseline = report.model_primary - best_baseline;
-    report.verdict = make_verdict(report.lift_vs_best_baseline);
+
+    // --- Verdict: judged against guessing, not against the probe ---
+    if (!std::isfinite(trivial_best)) trivial_best = 0.0;
+    report.lift_vs_trivial = report.model_primary - trivial_best;
+    const double headroom  = 1.0 - trivial_best;
+    double reduction = (headroom > 1e-12) ? report.lift_vs_trivial / headroom : 0.0;
+    bool learned = report.lift_vs_trivial > 1e-9;
+    if (is_classification) {
+        reduction = std::max(reduction, ll_reduction);
+        learned   = learned || ll_reduction > 0.02;
+    }
+    report.linear_is_enough = learned && std::isfinite(probe_primary)
+                           && std::abs(report.model_primary - probe_primary) <= 0.01;
+    report.verdict = make_verdict(learned, reduction, report.linear_is_enough);
     return report;
 }
 

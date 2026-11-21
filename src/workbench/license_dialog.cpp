@@ -4,6 +4,7 @@
 // exercise it without spinning up D3D11.
 
 #include "license_dialog.hpp"
+#include "neurograph/licensing/license.hpp"
 
 #include "imgui.h"
 
@@ -219,12 +220,16 @@ bool render_license_dialog(LicenseDialogState& d, LicenseStatus& status) {
             }
         }
 
-        // Helpful link target -- not actually clickable from ImGui in
-        // a portable way without OS shellopen, but useful as text.
         ImGui::Spacing();
         ImGui::Separator();
-        ImGui::TextDisabled(
-            "Need a key? Visit https://neurograph.ai/buy");
+        if (!licensing::licensing_configured()) {
+            ImGui::TextWrapped(
+                "This build has no licence check: every feature is available "
+                "without a key.");
+        } else {
+            ImGui::TextDisabled(
+                "Licence keys come from whoever supplied this copy of NeuroGraph.");
+        }
 
         ImGui::EndPopup();
     }

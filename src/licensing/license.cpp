@@ -309,6 +309,14 @@ const std::vector<unsigned char>& embedded_public_key() {
     return placeholder_public_key();
 }
 
+bool licensing_configured() {
+    const auto& k = embedded_public_key();
+    for (unsigned char b : k) {
+        if (b != 0) return true;
+    }
+    return false;
+}
+
 bool is_active(const License& l) {
     return l.expires > std::chrono::system_clock::now();
 }

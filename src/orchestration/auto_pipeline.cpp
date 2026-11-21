@@ -1,35 +1,29 @@
 #include "neurograph/orchestration/auto_pipeline.hpp"
 
-#include "neurograph/core/network.hpp"
 #include "neurograph/dataqc/scanner.hpp"
-#include "neurograph/eval/baselines.hpp"
-#include "neurograph/eval/classification.hpp"
-#include "neurograph/eval/learning_curve.hpp"
-#include "neurograph/eval/regression.hpp"
+#include "neurograph/models/automl.hpp"
+#include "neurograph/models/model.hpp"
 #include "neurograph/preprocess/pipeline.hpp"
 #include "neurograph/reporting/manifest.hpp"
 #include "neurograph/reporting/model_card.hpp"
-#include "neurograph/snapshot/snapshot_metadata.hpp"
-#include "neurograph/training/data_loader.hpp"
-#include "neurograph/training/io_manager.hpp"
-#include "neurograph/training/loss.hpp"
-#include "neurograph/training/training_engine.hpp"
-#include "neurograph/util/uuid.hpp"
+#include "neurograph/version.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <exception>
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
+#include <limits>
 #include <memory>
+#include <numeric>
 #include <random>
-#include <sstream>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace neurograph::orchestration {
@@ -37,609 +31,100 @@ namespace neurograph::orchestration {
 namespace {
 
 namespace fs = std::filesystem;
+using Clock = std::chrono::steady_clock;
 
-// ---------------------------------------------------------------------------
-// Bundle artifact filenames — kept in lockstep with reporting/manifest.cpp's
-// kArtifactDataset / kArtifactPipeline / kArtifactModel constants. P1-07
-// (predict.exe) and P1-08 (DLL) read these by the same names.
-// ---------------------------------------------------------------------------
+// File names inside a bundle. runtime/bundle.cpp and reporting/manifest.cpp
+// use the same names.
 constexpr const char* kBundlePipeline = "pipeline.ngpipe";
 constexpr const char* kBundleModel    = "model.ngm";
 constexpr const char* kBundleManifest = "manifest.json";
 constexpr const char* kBundleCard     = "card.md";
 
-// Stage progress weights — they sum to 1.0 and decide how each stage's
-// internal completion maps onto `Progress::overall_fraction`. The
-// training stage gets the lion's share because, for real models, that's
-// where the wall time goes; the linear-probe stand-in finishes much
-// faster but we want the bar to behave the same when the real trainer
-// lands. Order matches the Stage enum (Scanning ... Packaging).
+// model.ngm schema 3: the chosen models::Model, serialised by the model
+// itself. Schemas 1 (linear probe) and 2 (SON network) are still loaded
+// by the runtime for bundles written by older versions.
+constexpr int         kModelSchemaVersion = 3;
+constexpr const char* kTrainerName        = "neurograph_automl_v1";
+
+// Share of the progress bar for each stage, in Stage order. Training is
+// where the time goes.
 constexpr double kStageWeights[] = {
-    0.05,  // Scanning
-    0.10,  // Preprocessing
-    0.02,  // AutoConfig
-    0.45,  // Training
-    0.08,  // Evaluating
-    0.10,  // Baselining
-    0.15,  // LearningCurve
-    0.05,  // Packaging
+    0.03,  // Scanning
+    0.07,  // Preprocessing
+    0.01,  // AutoConfig
+    0.70,  // Training
+    0.05,  // Evaluating (scores and column importance)
+    0.03,  // Baselining
+    0.08,  // LearningCurve
+    0.03,  // Packaging
 };
 constexpr int kNumStages = sizeof(kStageWeights) / sizeof(kStageWeights[0]);
 
-// Sum of weights for stages strictly before `s`. Used to convert
-// (stage, stage_fraction) → overall_fraction.
-double overall_before(Stage s) {
-    const int idx = static_cast<int>(s);
-    double sum = 0.0;
-    for (int i = 0; i < idx && i < kNumStages; ++i) sum += kStageWeights[i];
-    return sum;
-}
+// Share of the time budget given to training the candidate models. The
+// rest covers evaluation and, when requested, the learning curve.
+constexpr double kTrainShareWithCurve    = 0.80;
+constexpr double kTrainShareWithoutCurve = 0.92;
 
 double overall_at(Stage s, double stage_fraction) {
     const int idx = static_cast<int>(s);
     if (idx >= kNumStages) return 1.0;
-    return overall_before(s) + kStageWeights[idx] * std::clamp(stage_fraction, 0.0, 1.0);
+    double before = 0.0;
+    for (int i = 0; i < idx; ++i) before += kStageWeights[i];
+    return before + kStageWeights[idx] * std::clamp(stage_fraction, 0.0, 1.0);
 }
 
-void emit(const ProgressCb& cb, Stage s, double sf, std::string msg) {
-    if (!cb) return;
-    Progress p;
-    p.stage            = s;
-    p.stage_fraction   = std::clamp(sf, 0.0, 1.0);
-    p.overall_fraction = overall_at(s, sf);
-    p.message          = std::move(msg);
-    cb(p);
+// Progress sink. The overall bar never moves backwards, whatever a
+// sub-stage reports.
+class Reporter {
+public:
+    explicit Reporter(ProgressCb cb) : cb_(std::move(cb)) {}
+
+    void operator()(Stage s, double stage_fraction, std::string msg) {
+        if (!cb_) return;
+        Progress p;
+        p.stage            = s;
+        p.stage_fraction   = std::clamp(stage_fraction, 0.0, 1.0);
+        p.overall_fraction = std::max(last_, overall_at(s, stage_fraction));
+        p.message          = std::move(msg);
+        last_ = p.overall_fraction;
+        cb_(p);
+    }
+
+private:
+    ProgressCb cb_;
+    double     last_ = 0.0;
+};
+
+bool is_cancelled(const CancelCb& cb) { return cb && cb(); }
+
+util::Error fail(std::string msg) { return util::Error(std::move(msg), 1); }
+
+double seconds_since(Clock::time_point t0) {
+    return std::chrono::duration<double>(Clock::now() - t0).count();
 }
 
-bool is_cancelled(const CancelCb& cb) {
-    return cb && cb();
+// UTF-8 text of a path, for messages. path::string() throws on Windows
+// for names outside the ANSI code page.
+std::string to_utf8(const fs::path& p) {
+    const auto u = p.u8string();
+    return std::string(u.begin(), u.end());
+}
+
+std::string fmt(const char* format, double v) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), format, v);
+    return buf;
 }
 
 // ---------------------------------------------------------------------------
-// Stand-in trainer.
-//
-// The orchestrator's "Training" stage uses the same numerically-tested
-// linear-probe core that powers `eval::compare_to_baselines`. This is a
-// deliberate placeholder so the orchestrator can ship end-to-end now;
-// when the real `TrainingEngine` adapter lands, only this struct + the
-// two `train_*` helpers below need to change. The model artifact format
-// `model.ngm` is also defined here — `predict.exe` reads it with the
-// same field names.
+// Data shaping
 // ---------------------------------------------------------------------------
 
-struct LinearModelCls {
-    int                              n_classes = 0;
-    int                              n_features = 0;
-    std::vector<std::vector<double>> W;       // K × D
-    std::vector<double>              b;       // K
-    std::vector<std::string>         class_labels;
-};
-
-struct LinearModelReg {
-    int                  n_features = 0;
-    std::vector<double>  w;                   // D
-    double               bias = 0.0;
-};
-
-void softmax_inplace(std::vector<double>& z) {
-    if (z.empty()) return;
-    const double m = *std::max_element(z.begin(), z.end());
-    double s = 0.0;
-    for (double& v : z) { v = std::exp(v - m); s += v; }
-    if (s > 0.0) for (double& v : z) v /= s;
-}
-
-// argmax of a one-hot / probability row.
 int argmax_row(const std::vector<double>& v) {
     if (v.empty()) return -1;
-    int k = 0;
-    for (int i = 1; i < static_cast<int>(v.size()); ++i)
-        if (v[i] > v[k]) k = i;
-    return k;
+    return static_cast<int>(std::max_element(v.begin(), v.end()) - v.begin());
 }
 
-LinearModelCls train_classification(
-    const std::vector<std::vector<double>>& X_train,
-    const std::vector<int>&                 y_idx,
-    int                                     n_classes,
-    int                                     n_iters,
-    double                                  lr) {
-
-    LinearModelCls m;
-    m.n_classes = n_classes;
-    if (X_train.empty() || n_classes < 2) return m;
-
-    const std::size_t N = X_train.size();
-    const std::size_t D = X_train.front().size();
-    m.n_features = static_cast<int>(D);
-    m.W.assign(n_classes, std::vector<double>(D, 0.0));
-    m.b.assign(n_classes, 0.0);
-
-    for (int it = 0; it < n_iters; ++it) {
-        std::vector<std::vector<double>> probs(N, std::vector<double>(n_classes, 0.0));
-        for (std::size_t i = 0; i < N; ++i) {
-            std::vector<double> z(n_classes, 0.0);
-            for (int k = 0; k < n_classes; ++k) {
-                double s = m.b[k];
-                for (std::size_t d = 0; d < D; ++d) s += m.W[k][d] * X_train[i][d];
-                z[k] = s;
-            }
-            softmax_inplace(z);
-            probs[i] = z;
-        }
-        std::vector<std::vector<double>> dW(n_classes, std::vector<double>(D, 0.0));
-        std::vector<double>              db(n_classes, 0.0);
-        for (std::size_t i = 0; i < N; ++i) {
-            for (int k = 0; k < n_classes; ++k) {
-                const double err = probs[i][k] - ((y_idx[i] == k) ? 1.0 : 0.0);
-                db[k] += err;
-                for (std::size_t d = 0; d < D; ++d) dW[k][d] += err * X_train[i][d];
-            }
-        }
-        const double inv_n = 1.0 / static_cast<double>(N);
-        for (int k = 0; k < n_classes; ++k) {
-            m.b[k] -= lr * inv_n * db[k];
-            for (std::size_t d = 0; d < D; ++d) m.W[k][d] -= lr * inv_n * dW[k][d];
-        }
-    }
-    return m;
-}
-
-std::vector<std::vector<double>> predict_classification(
-    const LinearModelCls& m,
-    const std::vector<std::vector<double>>& X) {
-
-    std::vector<std::vector<double>> out(X.size(),
-                                         std::vector<double>(m.n_classes, 0.0));
-    if (m.n_classes < 2) return out;
-    for (std::size_t i = 0; i < X.size(); ++i) {
-        std::vector<double> z(m.n_classes, 0.0);
-        for (int k = 0; k < m.n_classes; ++k) {
-            double s = m.b[k];
-            for (std::size_t d = 0; d < X[i].size() && d < static_cast<std::size_t>(m.n_features); ++d) {
-                s += m.W[k][d] * X[i][d];
-            }
-            z[k] = s;
-        }
-        softmax_inplace(z);
-        out[i] = std::move(z);
-    }
-    return out;
-}
-
-LinearModelReg train_regression(
-    const std::vector<std::vector<double>>& X_train,
-    const std::vector<double>&              y_train,
-    int                                     n_iters,
-    double                                  lr,
-    double                                  l2) {
-
-    LinearModelReg m;
-    if (X_train.empty()) return m;
-    const std::size_t N = X_train.size();
-    const std::size_t D = X_train.front().size();
-    m.n_features = static_cast<int>(D);
-    m.w.assign(D, 0.0);
-    m.bias = 0.0;
-
-    for (int it = 0; it < n_iters; ++it) {
-        std::vector<double> errs(N, 0.0);
-        for (std::size_t i = 0; i < N; ++i) {
-            double yhat = m.bias;
-            for (std::size_t d = 0; d < D; ++d) yhat += m.w[d] * X_train[i][d];
-            errs[i] = yhat - y_train[i];
-        }
-        std::vector<double> dw(D, 0.0);
-        double              db_acc = 0.0;
-        for (std::size_t i = 0; i < N; ++i) {
-            db_acc += errs[i];
-            for (std::size_t d = 0; d < D; ++d) dw[d] += errs[i] * X_train[i][d];
-        }
-        const double inv_n = 1.0 / static_cast<double>(N);
-        m.bias -= lr * 2.0 * inv_n * db_acc;
-        for (std::size_t d = 0; d < D; ++d) {
-            m.w[d] -= lr * (2.0 * inv_n * dw[d] + 2.0 * l2 * m.w[d]);
-        }
-    }
-    return m;
-}
-
-std::vector<double> predict_regression(const LinearModelReg& m,
-                                       const std::vector<std::vector<double>>& X) {
-    std::vector<double> out(X.size(), 0.0);
-    for (std::size_t i = 0; i < X.size(); ++i) {
-        double yhat = m.bias;
-        for (std::size_t d = 0; d < X[i].size() && d < static_cast<std::size_t>(m.n_features); ++d) {
-            yhat += m.w[d] * X[i][d];
-        }
-        out[i] = yhat;
-    }
-    return out;
-}
-
-// ---------------------------------------------------------------------------
-// SON-trained model (P1-15) — replaces the placeholder for the main
-// Training stage. The network is constructed fresh per run; self-org
-// grows hidden neurons during training when interleave_self_org is on.
-//
-// We hold the trained artifacts (network, IO mapping, normalization
-// stats, predictions) in a single struct so the orchestrator can
-// pass them to the bundle-write step without re-running training.
-// ---------------------------------------------------------------------------
-
-struct SonTrainedModel {
-    // Owned: the network grew under self-org so the orchestrator owns
-    // it (rather than letting TrainingEngine destruct it on scope exit).
-    std::unique_ptr<core::Network>           network;
-    // Snapshotted from the engine's IOManager — neuron-id→feature/output
-    // mapping needed by the bundle loader.
-    std::vector<std::string>                 input_neuron_ids;
-    std::vector<std::string>                 output_neuron_ids;
-    std::vector<std::string>                 class_labels;
-    int                                      n_features = 0;
-    int                                      n_outputs  = 0;
-    // Final-epoch metric numbers, surfaced into the manifest.
-    int                                      epochs_run = 0;
-    double                                   final_train_loss = 0.0;
-    double                                   final_val_loss   = 0.0;
-};
-
-// Convert a TransformedDataset row pair into a Sample list. The
-// preprocess pipeline already produced normalized features and one-hot
-// targets (cls) or scalar-in-vector targets (reg), which is exactly
-// the schema TrainingEngine::load_prepared_dataset expects.
-std::vector<training::Sample> to_samples(
-    const std::vector<std::vector<double>>& X,
-    const std::vector<std::vector<double>>& y,
-    bool is_cls,
-    const std::vector<std::string>&         class_labels) {
-
-    std::vector<training::Sample> out;
-    out.reserve(X.size());
-    for (std::size_t i = 0; i < X.size(); ++i) {
-        training::Sample s;
-        s.features = X[i];
-        s.target   = y[i];
-        if (is_cls) {
-            const int cls_idx = argmax_row(y[i]);
-            if (cls_idx >= 0 && cls_idx < static_cast<int>(class_labels.size())) {
-                s.label = class_labels[cls_idx];
-            }
-        }
-        out.push_back(std::move(s));
-    }
-    return out;
-}
-
-// Compute a sane epoch budget from the wizard's time_budget_seconds.
-// Rough mapping (matches how the wizard's Quick/Balanced/Best radio
-// translates):
-//   - <60s    (Quick)    →  30 epochs
-//   - 60-300s (Balanced) →  80 epochs
-//   - >300s   (Best)     → 200 epochs
-// The optimizer's early-stopping (patience=20) often bails earlier.
-int epochs_from_budget(int time_budget_seconds) {
-    if (time_budget_seconds <  60) return 30;
-    if (time_budget_seconds < 300) return 80;
-    return 200;
-}
-
-// Train the SON network end-to-end. Returns the trained network +
-// inference metadata, or an Error suitable for `fail()` rendering.
-util::Result<SonTrainedModel> train_with_engine(
-    const preprocess::TransformedDataset& ds,
-    bool                                  is_cls,
-    int                                   n_classes,
-    int                                   time_budget_seconds,
-    std::uint64_t                         seed,
-    const ProgressCb&                     progress,
-    const CancelCb&                       cancel) {
-
-    // Deterministic UUIDs + deterministic self-org for the duration of
-    // the training stage so `model.ngm` is byte-reproducible across runs
-    // with the same seed.
-    //   - util::DeterministicUuidScope (P1-15): routes
-    //     core::NeuronId::generate() through a seeded RNG.
-    //   - core::DeterministicSelfOrgScope (P1-19): same idea for the
-    //     RNG inside Network::self_organize / grow_neurons / etc., so
-    //     enabling interleave_self_org below doesn't break determinism.
-    // Distinct seed offsets so the two RNG streams aren't aliased
-    // (sharing one seed across two independent random sources is a
-    // classic source of subtle correlation bugs).
-    util::DeterministicUuidScope         uuid_scope(seed);
-    core::DeterministicSelfOrgScope      selforg_scope(seed ^ 0x5a5a5a5a5a5a5a5aULL);
-
-    SonTrainedModel out;
-    out.network    = std::make_unique<core::Network>();
-    out.n_features = static_cast<int>(ds.X_train.front().size());
-    out.n_outputs  = is_cls ? n_classes : 1;
-    if (is_cls) out.class_labels = ds.class_labels;
-
-    // P1-16 + P1-19 bounded growth: self-org is now safe to enable in
-    // the orchestrator. Conservative caps so growth stays subtle on
-    // the small datasets typical of the wizard's first-run flow:
-    //   - max_neurons = 256 (hard ceiling).
-    //   - max_split_fraction_per_cycle = 0.05 (each cycle splits at
-    //     most 5% of the network — chosen so 80-epoch training with
-    //     self-org every 10 epochs produces ~8 growth events that
-    //     compound to ~1.05^8 ≈ 1.5× initial size, not so large
-    //     that it disrupts the regression's gradient descent).
-    //   - growth_patience = 10 (gate on real loss-stall, not just
-    //     epoch count, so well-fitting models don't grow needlessly).
-    {
-        core::TopologyConfig tcfg;
-        tcfg.max_neurons                  = 256;
-        tcfg.max_split_fraction_per_cycle = 0.05;
-        tcfg.max_hidden_neurons           = 200;
-        tcfg.use_stall_counter            = true;
-        tcfg.growth_patience              = 10;
-        out.network->set_topology_config(tcfg);
-    }
-
-    training::TrainingEngine engine(*out.network);
-
-    auto train_samples = to_samples(ds.X_train, ds.y_train, is_cls, ds.class_labels);
-    auto val_samples   = to_samples(ds.X_val,   ds.y_val,   is_cls, ds.class_labels);
-
-    // P1-18: explicit hidden-layer sizing. Auto-pick (clamp(2 * features, 8, 64))
-    // is fine for the orchestrator's tabular workloads.
-    auto load_r = engine.load_prepared_dataset(
-        std::move(train_samples), std::move(val_samples),
-        out.n_features, out.n_outputs, out.class_labels, seed,
-        training::TrainingEngine::kAutoHiddenSize);
-    if (!load_r.ok()) {
-        return util::Error("Training setup failed: " + load_r.error().message);
-    }
-
-    // P1-17: for classification, override the output-neuron activation
-    // from the IOManager default (SIGMOID for cls heads) to LINEAR so
-    // the values feeding CrossEntropyLoss's internal softmax are raw
-    // logits with full gradient magnitude. Regression already gets
-    // LINEAR by default per the IOManager heuristic.
-    if (is_cls) {
-        if (auto* iom = engine.io_manager()) {
-            for (const auto& out_id : iom->output_ids()) {
-                if (auto* n = out.network->get_neuron(out_id)) {
-                    n->set_activation_type(core::ActivationType::LINEAR);
-                }
-            }
-        }
-    }
-
-    // Snapshot the IO mapping right after load — these neuron ids are
-    // stable for the rest of the network's life because IO neurons are
-    // marked protected before self_organize() runs. Convert from
-    // strong-typed core::NeuronId to plain std::string for the JSON
-    // bundle schema (the bundle loader rebuilds NeuronId from string).
-    if (auto* iom = engine.io_manager()) {
-        out.input_neuron_ids.reserve(iom->input_ids().size());
-        for (const auto& id : iom->input_ids())  out.input_neuron_ids.push_back(id.value());
-        out.output_neuron_ids.reserve(iom->output_ids().size());
-        for (const auto& id : iom->output_ids()) out.output_neuron_ids.push_back(id.value());
-    }
-
-    training::SupervisedConfig cfg;
-    cfg.epochs              = epochs_from_budget(time_budget_seconds);
-    // Cap batch_size at quarter-of-train so small datasets don't end
-    // up with a single batch (which kills the SGD-noise benefit).
-    cfg.batch_size          = std::max<std::size_t>(
-        1, std::min<std::size_t>(16, ds.X_train.size() / 4));
-    // P1-15/17: cls now uses CrossEntropyLoss on LINEAR-output logits
-    // (the canonical setup) — the loss applies softmax internally and
-    // produces well-conditioned gradients. Reg still uses MSE.
-    cfg.loss_type           = is_cls ? training::LossType::CROSS_ENTROPY
-                                     : training::LossType::MSE;
-    cfg.optimizer_name      = "adam";
-    // LR = 0.01 — verified to converge in the P1-18 unit test
-    // (`TrainingEngine.HiddenLayerNetworkLearnsSeparableData`) at this
-    // value; matches the proven Iris-classification setup in
-    // `tests/integration/test_all_phases.cpp`.
-    cfg.optimizer_config.learning_rate = 0.01;
-    // P1-20: self-org re-enabled in growth-only mode. The full
-    // `Network::self_organize` runs 9 phases, three of which (rewire,
-    // Hebbian-strengthen, activation-mutation) overwrite weights the
-    // supervised optimizer has been tuning and break convergence
-    // (iris went 0.93 → 0.33 with full self-org running every 10
-    // epochs). `growth_only_self_organize` runs only the prune-synapses
-    // + prune-dead-neurons + grow-stressed phases, all of which adapt
-    // capacity without disrupting backprop's gradient signal.
-    // Combined with P1-16 bounded growth + P1-19 deterministic RNG,
-    // the wizard now ships actual self-organizing capacity adaptation.
-    // For classification: turn on. For regression: keep off — small
-    // datasets + split events still cause modest fit regression even
-    // with growth-only (R² 0.85 → 0.7 in EndToEndRegressionProducesBundle),
-    // so we hold this off until we can size growth more conservatively.
-    cfg.interleave_self_org = is_cls;
-    cfg.self_org_interval   = 10;
-    cfg.self_org_steps      = 1;
-    cfg.self_org_growth_only = true;
-    cfg.dropout_rate        = 0.0;      // Small nets; dropout hurts more than helps.
-    cfg.batch_norm          = false;    // ditto
-    cfg.patience            = 20;
-    cfg.min_delta           = 1e-3;
-    cfg.warmup_epochs       = std::min(5, cfg.epochs / 4);
-
-    // Forward training progress to the wizard's progress bar.
-    // Cancellation is checked every callback (every epoch) so users
-    // get sub-second responsiveness.
-    training::TrainingCallback cb =
-        [&, total = cfg.epochs](const training::EpochResult& er) {
-        const double frac = static_cast<double>(er.epoch + 1)
-                          / static_cast<double>(total);
-        std::ostringstream msg;
-        msg << "Epoch " << (er.epoch + 1) << "/" << total
-            << " — train_loss=" << std::fixed << std::setprecision(4)
-            << er.train_loss
-            << " val_loss="   << er.val_loss;
-        emit(progress, Stage::Training, frac, msg.str());
-        out.epochs_run       = er.epoch + 1;
-        out.final_train_loss = er.train_loss;
-        out.final_val_loss   = er.val_loss;
-        if (is_cancelled(cancel)) {
-            engine.request_stop();
-        }
-    };
-
-    auto train_r = engine.train(cfg, cb);
-    if (!train_r.ok()) {
-        return util::Error("Training failed: " + train_r.error().message);
-    }
-    if (is_cancelled(cancel)) {
-        return util::Error("Cancelled by user.");
-    }
-
-    return out;
-}
-
-// Predictions on a held-out set, going through the same forward pass
-// the bundle's predict.exe will use. For classification we softmax the
-// raw output activations because the network's outputs aren't
-// constrained to the simplex by default.
-// Build a snapshot::IOMapping from the SonTrainedModel so a fresh
-// IOManager can be re-attached to the trained network without
-// re-creating neurons. The neuron ids in the model are the strings
-// we snapshotted right after `load_prepared_dataset` ran; they're
-// stable because IO neurons are protected from self-org.
-snapshot::IOMapping mapping_from_model(const SonTrainedModel& model) {
-    snapshot::IOMapping m;
-    m.input_neuron_ids  = model.input_neuron_ids;
-    m.output_neuron_ids = model.output_neuron_ids;
-    m.input_features    = model.n_features;
-    m.output_classes    = model.n_outputs;
-    m.class_labels      = model.class_labels;
-    return m;
-}
-
-std::vector<std::vector<double>> predict_with_engine_cls(
-    core::Network&                          network,
-    const SonTrainedModel&                  model,
-    const std::vector<std::vector<double>>& X) {
-
-    // Re-attach an IOManager + Backprop to the trained network. Use
-    // load_io_mapping (NOT ensure_io_neurons) so we bind to the
-    // existing trained IO neurons rather than creating new ones.
-    training::IOManager iom(network);
-    auto io_r = iom.load_io_mapping(mapping_from_model(model));
-    if (!io_r.ok()) return {};
-    training::Backprop bp(network, iom);
-    bp.set_training_mode(false);
-    bp.rebuild_topo_order();
-
-    std::vector<std::vector<double>> out;
-    out.reserve(X.size());
-    for (const auto& xv : X) {
-        bp.forward(xv);
-        auto z = iom.read_outputs();
-        softmax_inplace(z);  // LINEAR outputs → softmax to probabilities
-        out.push_back(std::move(z));
-    }
-    return out;
-}
-
-std::vector<double> predict_with_engine_reg(
-    core::Network&                          network,
-    const SonTrainedModel&                  model,
-    const std::vector<std::vector<double>>& X) {
-
-    training::IOManager iom(network);
-    auto io_r = iom.load_io_mapping(mapping_from_model(model));
-    if (!io_r.ok()) return {};
-    training::Backprop bp(network, iom);
-    bp.set_training_mode(false);
-    bp.rebuild_topo_order();
-
-    std::vector<double> out;
-    out.reserve(X.size());
-    for (const auto& xv : X) {
-        bp.forward(xv);
-        const auto z = iom.read_outputs();
-        out.push_back(z.empty() ? 0.0 : z[0]);
-    }
-    return out;
-}
-
-// ---------------------------------------------------------------------------
-// model.ngm serialization.
-//
-// Two schemas live side-by-side now:
-//   v1 — kind="classification"|"regression": linear-probe weights.
-//        Still used by the learning-curve sub-runs (4 trainings) to
-//        keep curve cost bounded; predict.exe still loads these.
-//   v2 — kind="neural_cls_v1"|"neural_reg_v1": full SON-trained
-//        network serialized via core::Network::to_json + the IO mapping
-//        the bundle loader uses to wire IOManager back up.
-// predict.exe / runtime/bundle.cpp dispatches on `kind`.
-// ---------------------------------------------------------------------------
-constexpr int kModelSchemaVersion = 2;
-
-void save_model_classification(const LinearModelCls& m, const fs::path& path) {
-    nlohmann::json j;
-    j["schema_version"]    = 1;  // linear probe is the v1 schema
-    j["kind"]              = "classification";
-    j["n_classes"]         = m.n_classes;
-    j["n_features"]        = m.n_features;
-    j["class_labels"]      = m.class_labels;
-    j["W"]                 = m.W;
-    j["b"]                 = m.b;
-    std::ofstream f(path);
-    if (!f) throw std::runtime_error("auto_pipeline: cannot open " + path.string());
-    f << j.dump(2);
-}
-
-void save_model_regression(const LinearModelReg& m, const fs::path& path) {
-    nlohmann::json j;
-    j["schema_version"] = 1;  // linear probe is the v1 schema
-    j["kind"]           = "regression";
-    j["n_features"]     = m.n_features;
-    j["w"]              = m.w;
-    j["bias"]           = m.bias;
-    std::ofstream f(path);
-    if (!f) throw std::runtime_error("auto_pipeline: cannot open " + path.string());
-    f << j.dump(2);
-}
-
-// SON model serialization. The full Network grew under self-org, so we
-// dump it via Network::to_json and pair it with the IO mapping (input
-// neuron ids in feature order, output neuron ids in class order). The
-// bundle loader reconstructs Network::from_json + IOManager + Backprop
-// in inference mode.
-void save_model_neural(const SonTrainedModel& sm,
-                       bool                   is_cls,
-                       const fs::path&        path) {
-    nlohmann::json j;
-    j["schema_version"]    = kModelSchemaVersion;  // 2
-    j["kind"]              = is_cls ? "neural_cls_v1" : "neural_reg_v1";
-    j["n_features"]        = sm.n_features;
-    j["n_outputs"]         = sm.n_outputs;
-    // bundle.cpp's neural_cls_v1 loader reads `n_classes` (mirrors the
-    // linear probe's schema) — emit it as a duplicate of n_outputs for
-    // cls bundles so the loader doesn't have to special-case missing
-    // fields.
-    if (is_cls) j["n_classes"] = sm.n_outputs;
-    j["class_labels"]      = sm.class_labels;       // empty for reg
-    j["network"]           = sm.network->to_json();
-    j["io_mapping"]        = {
-        {"input_neuron_ids",  sm.input_neuron_ids},
-        {"output_neuron_ids", sm.output_neuron_ids},
-        {"input_features",    sm.n_features},
-        {"output_classes",    sm.n_outputs},
-        {"class_labels",      sm.class_labels},
-    };
-    j["training_summary"]  = {
-        {"epochs_run",        sm.epochs_run},
-        {"final_train_loss",  sm.final_train_loss},
-        {"final_val_loss",    sm.final_val_loss},
-    };
-    std::ofstream f(path);
-    if (!f) throw std::runtime_error("auto_pipeline: cannot open " + path.string());
-    f << j.dump(2);
-}
-
-// ---------------------------------------------------------------------------
-// Misc helpers
-// ---------------------------------------------------------------------------
-
-// Convert one-hot training rows to integer class indices.
 std::vector<int> argmax_rows(const std::vector<std::vector<double>>& rows) {
     std::vector<int> out;
     out.reserve(rows.size());
@@ -654,111 +139,320 @@ std::vector<double> flatten_scalar(const std::vector<std::vector<double>>& rows)
     return out;
 }
 
-// Per-stage iteration count derived from time_budget_seconds. Linear
-// probe doesn't actually consume the full budget — this keeps the
-// API contract honest so the swap to TrainingEngine can scale epochs
-// from `time_budget_seconds * kStageWeights[Training]` later.
-int iters_for_training(int time_budget_seconds) {
-    // 100 iters fixed for the placeholder. We document the weight
-    // calc so the future swap is obvious.
-    (void)time_budget_seconds;  // placeholder uses fixed iter count
-    return 100;
-}
-
-// One-liner the wizard's success toast renders. Format depends on
-// task kind.
-std::string make_summary(bool is_cls,
-                         const eval::ClassificationMetrics* cls,
-                         const eval::RegressionMetrics*     reg,
-                         const eval::BaselineReport&        bl) {
-    std::ostringstream os;
-    if (is_cls && cls) {
-        os << "Trained classifier: accuracy = "
-           << std::fixed << std::setprecision(3) << cls->accuracy
-           << " (lift +" << std::setprecision(3) << bl.lift_vs_best_baseline
-           << " over best baseline). " << bl.verdict;
-    } else if (!is_cls && reg) {
-        os << "Trained regressor: R\xc2\xb2 = "
-           << std::fixed << std::setprecision(3) << reg->r2
-           << " (RMSE " << reg->rmse << "). " << bl.verdict;
+models::TrainSet make_train_set(bool cls, int n_classes,
+                                const std::vector<std::vector<double>>& X_train,
+                                const std::vector<std::vector<double>>& y_train,
+                                const std::vector<std::vector<double>>& X_val,
+                                const std::vector<std::vector<double>>& y_val) {
+    models::TrainSet t;
+    t.task      = cls ? models::Task::Classification : models::Task::Regression;
+    t.n_classes = cls ? n_classes : 0;
+    t.X_train   = models::Matrix::from_rows(X_train);
+    t.X_val     = models::Matrix::from_rows(X_val);
+    if (cls) {
+        t.y_train_cls = argmax_rows(y_train);
+        t.y_val_cls   = argmax_rows(y_val);
     } else {
-        os << "Training complete. " << bl.verdict;
+        t.y_train_reg = flatten_scalar(y_train);
+        t.y_val_reg   = flatten_scalar(y_val);
     }
-    return os.str();
+    return t;
 }
 
-// Pipeline → JSON for the manifest's embedded config blob.
-nlohmann::json pipeline_config_to_json(const preprocess::PipelineConfig& c) {
-    nlohmann::json j;
-    j["target_column"] = c.target_column;
-    j["val_fraction"]  = c.val_fraction;
-    j["test_fraction"] = c.test_fraction;
-    j["stratify"]      = c.stratify;
-    j["split_seed"]    = c.split_seed;
-    nlohmann::json cols = nlohmann::json::array();
-    for (const auto& col : c.columns) {
-        nlohmann::json cj;
-        cj["name"]       = col.name;
-        cj["is_target"]  = col.is_target;
-        cj["is_numeric"] = col.is_numeric;
-        cj["drop"]       = col.drop;
-        cols.push_back(std::move(cj));
+// Probabilities (classification) or a one-value row (regression) per row.
+std::vector<std::vector<double>> predict_rows(const models::Model& m,
+                                              const models::Matrix& X) {
+    const std::size_t k = static_cast<std::size_t>(std::max(1, m.n_outputs()));
+    std::vector<std::vector<double>> out(X.rows, std::vector<double>(k, 0.0));
+    for (std::size_t i = 0; i < X.rows; ++i) m.predict(X.row(i), out[i].data());
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Column importance
+//
+// Shuffle one source column's values between rows (all the features made
+// from it move together: one-hot slots, date parts, the blank flag) and
+// measure how much worse the model gets. Deterministic for a given seed:
+// the amount of work depends on the shape of the data, never on timing.
+// ---------------------------------------------------------------------------
+
+struct LossScore {
+    double loss  = 0.0;   // log-loss, or squared error / variance
+    double score = 0.0;   // accuracy, or R²
+};
+
+LossScore loss_and_score(const models::Model& m, const models::Matrix& X,
+                         const std::vector<int>& y_cls,
+                         const std::vector<double>& y_reg) {
+    LossScore r;
+    if (X.rows == 0) return r;
+    const std::size_t k = static_cast<std::size_t>(std::max(1, m.n_outputs()));
+    std::vector<double> out(k);
+    if (m.task() == models::Task::Classification) {
+        double ll = 0.0;
+        std::size_t correct = 0;
+        for (std::size_t i = 0; i < X.rows; ++i) {
+            m.predict(X.row(i), out.data());
+            const int y = y_cls[i];
+            ll += -std::log(std::max(out[static_cast<std::size_t>(y)], 1e-15));
+            if (argmax_row(out) == y) ++correct;
+        }
+        r.loss  = ll / static_cast<double>(X.rows);
+        r.score = static_cast<double>(correct) / static_cast<double>(X.rows);
+        return r;
     }
-    j["columns"] = std::move(cols);
-    return j;
+    double mean = 0.0;
+    for (std::size_t i = 0; i < X.rows; ++i) mean += y_reg[i];
+    mean /= static_cast<double>(X.rows);
+    double sse = 0.0, sst = 0.0;
+    for (std::size_t i = 0; i < X.rows; ++i) {
+        m.predict(X.row(i), out.data());
+        sse += (out[0] - y_reg[i]) * (out[0] - y_reg[i]);
+        sst += (y_reg[i] - mean) * (y_reg[i] - mean);
+    }
+    r.score = (sst > 0.0) ? 1.0 - sse / sst : 0.0;
+    r.loss  = (sst > 0.0) ? sse / sst : sse / static_cast<double>(X.rows);
+    return r;
 }
 
-// Training config → JSON. P1-15: orchestrator now drives the SON
-// `TrainingEngine`, so the manifest reflects the real network's
-// hyperparameters and final-epoch metrics.
-nlohmann::json training_config_to_json_son(const SonTrainedModel& sm,
-                                            std::uint64_t          seed,
-                                            int                    epochs,
-                                            std::size_t            batch_size,
-                                            bool                   is_cls) {
+std::vector<ColumnImportance> permutation_importance(
+    const models::Model&            model,
+    const models::Matrix&           X_all,
+    const std::vector<int>&         y_cls_all,
+    const std::vector<double>&      y_reg_all,
+    const std::vector<std::string>& feature_sources,
+    std::uint64_t                   seed,
+    const CancelCb&                 cancel) {
+
+    std::vector<ColumnImportance> out;
+    const bool cls = (model.task() == models::Task::Classification);
+
+    // Group feature indices by the CSV column they came from.
+    std::vector<std::string>              names;
+    std::vector<std::vector<std::size_t>> groups;
+    const std::size_t width = std::min(feature_sources.size(), X_all.cols);
+    for (std::size_t f = 0; f < width; ++f) {
+        const auto it = std::find(names.begin(), names.end(), feature_sources[f]);
+        if (it == names.end()) {
+            names.push_back(feature_sources[f]);
+            groups.push_back({f});
+        } else {
+            groups[static_cast<std::size_t>(it - names.begin())].push_back(f);
+        }
+    }
+    if (names.empty() || X_all.rows < 10) return out;
+
+    // Work grows with columns x repeats x rows; keep it to a few hundred
+    // thousand predictions.
+    const std::size_t n_groups = names.size();
+    const int repeats = (n_groups <= 30) ? 3 : (n_groups <= 100 ? 2 : 1);
+    const std::size_t row_cap = std::clamp<std::size_t>(
+        600000 / (n_groups * static_cast<std::size_t>(repeats)), 300, 3000);
+    const std::size_t rows = std::min(X_all.rows, row_cap);
+
+    std::mt19937_64 rng(seed);
+    std::vector<std::size_t> pick(X_all.rows);
+    std::iota(pick.begin(), pick.end(), std::size_t{0});
+    if (rows < X_all.rows) {
+        std::shuffle(pick.begin(), pick.end(), rng);
+        pick.resize(rows);
+        std::sort(pick.begin(), pick.end());
+    }
+
+    // Working copy; shuffled columns are written into it and restored.
+    models::Matrix X;
+    X.rows = rows;
+    X.cols = X_all.cols;
+    X.data.resize(rows * X.cols);
+    std::vector<int>    y_cls;
+    std::vector<double> y_reg;
+    for (std::size_t i = 0; i < rows; ++i) {
+        std::copy_n(X_all.row(pick[i]), X.cols, X.row(i));
+        if (cls) y_cls.push_back(y_cls_all[pick[i]]);
+        else     y_reg.push_back(y_reg_all[pick[i]]);
+    }
+    const LossScore base = loss_and_score(model, X, y_cls, y_reg);
+
+    std::vector<std::size_t> perm(rows);
+    std::vector<double>      saved;
+    for (std::size_t g = 0; g < n_groups; ++g) {
+        if (is_cancelled(cancel)) return {};
+        const auto& feats = groups[g];
+        const std::size_t nf = feats.size();
+        saved.resize(rows * nf);
+        for (std::size_t i = 0; i < rows; ++i)
+            for (std::size_t j = 0; j < nf; ++j)
+                saved[i * nf + j] = X.row(i)[feats[j]];
+
+        double loss_up = 0.0, score_down = 0.0;
+        for (int r = 0; r < repeats; ++r) {
+            std::iota(perm.begin(), perm.end(), std::size_t{0});
+            std::shuffle(perm.begin(), perm.end(), rng);
+            for (std::size_t i = 0; i < rows; ++i)
+                for (std::size_t j = 0; j < nf; ++j)
+                    X.row(i)[feats[j]] = saved[perm[i] * nf + j];
+            const LossScore p = loss_and_score(model, X, y_cls, y_reg);
+            loss_up    += p.loss - base.loss;
+            score_down += base.score - p.score;
+        }
+        for (std::size_t i = 0; i < rows; ++i)
+            for (std::size_t j = 0; j < nf; ++j)
+                X.row(i)[feats[j]] = saved[i * nf + j];
+
+        ColumnImportance ci;
+        ci.column        = names[g];
+        ci.loss_increase = loss_up / repeats;
+        ci.score_drop    = score_down / repeats;
+        out.push_back(std::move(ci));
+    }
+
+    double top = 0.0;
+    for (const auto& c : out) top = std::max(top, c.loss_increase);
+    for (auto& c : out) c.relative = (top > 0.0) ? std::max(0.0, c.loss_increase) / top : 0.0;
+    std::stable_sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+        return a.loss_increase > b.loss_increase;
+    });
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Bundle files
+// ---------------------------------------------------------------------------
+
+void save_model_v3(const models::Model& m, bool is_cls,
+                   const std::vector<std::string>& class_labels,
+                   const std::string& target_column, const fs::path& path) {
     nlohmann::json j;
-    j["trainer"]              = "neurograph_son_v1";
-    j["epochs_configured"]    = epochs;
-    j["epochs_run"]           = sm.epochs_run;
-    j["batch_size"]           = batch_size;
-    j["optimizer"]            = "adam";
-    j["learning_rate"]        = 0.01;
-    j["loss"]                 = is_cls ? "cross_entropy" : "mse";
-    j["interleave_self_org"]  = is_cls;   // P1-20: cls-only growth-only mode
-    j["self_org_interval"]    = 10;
-    j["self_org_growth_only"] = true;
-    j["max_neurons_cap"]      = 256;
-    j["seed"]                 = seed;
-    j["final_train_loss"]     = sm.final_train_loss;
-    j["final_val_loss"]       = sm.final_val_loss;
-    j["network_neuron_count"] = sm.network ? sm.network->neuron_count() : 0;
-    j["network_synapse_count"]= sm.network ? sm.network->synapse_count() : 0;
-    return j;
+    j["schema_version"] = kModelSchemaVersion;
+    j["kind"]           = m.kind();
+    j["task"]           = is_cls ? "classification" : "regression";
+    j["n_features"]     = m.n_features();
+    j["class_labels"]   = is_cls ? class_labels : std::vector<std::string>{};
+    j["target_column"]  = target_column;
+    j["trainer"]        = kTrainerName;
+    j["description"]    = m.describe();
+    j["model"]          = m.to_json();
+    std::ofstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open " + to_utf8(path));
+    f << j.dump();
+    if (!f) throw std::runtime_error("write failed for " + to_utf8(path));
 }
 
-// Linear-probe variant retained for the learning-curve sub-runs which
-// still use the linear trainer (4 trainings; SON would 4x wall time).
-// Not currently wired into the manifest path but kept to avoid
-// dead-code warnings if another caller wants it later.
-[[maybe_unused]] nlohmann::json training_config_to_json(
-    int iters, double lr, std::uint64_t seed) {
+const char* task_name(preprocess::TaskChoice t) {
+    switch (t) {
+        case preprocess::TaskChoice::Classification: return "classification";
+        case preprocess::TaskChoice::Regression:     return "regression";
+        case preprocess::TaskChoice::Auto:           break;
+    }
+    return "auto";
+}
+
+nlohmann::json pipeline_config_to_json(const preprocess::PipelineConfig& c,
+                                       const std::vector<preprocess::ColumnDecision>& cols) {
     nlohmann::json j;
-    j["trainer"]       = "linear_probe_v1";
-    j["iters"]         = iters;
-    j["learning_rate"] = lr;
-    j["seed"]          = seed;
+    j["target_column"]   = c.target_column;
+    j["val_fraction"]    = c.val_fraction;
+    j["test_fraction"]   = c.test_fraction;
+    j["stratify"]        = c.stratify;
+    j["split_seed"]      = c.split_seed;
+    j["exclude_columns"] = c.exclude_columns;
+    j["task"]            = task_name(c.task);
+    nlohmann::json arr = nlohmann::json::array();
+    for (const auto& d : cols) {
+        arr.push_back({{"name", d.name}, {"role", d.role}, {"note", d.note}});
+    }
+    j["columns"] = std::move(arr);
     return j;
 }
 
-util::Error fail(std::string msg, int code = 1) {
-    return util::Error(std::move(msg), code);
+nlohmann::json number_or_null(double v) {
+    return std::isfinite(v) ? nlohmann::json(v) : nlohmann::json(nullptr);
+}
+
+nlohmann::json training_config_to_json(const AutoOptions& opts, const AutoResult& res,
+                                       const models::Model& model) {
+    nlohmann::json j;
+    j["trainer"]             = kTrainerName;
+    j["time_budget_seconds"] = opts.time_budget_seconds;
+    j["thorough"]            = opts.thorough;
+    j["seed"]                = opts.seed;
+    j["chosen"] = {
+        {"name",        res.model_name},
+        {"kind",        model.kind()},
+        {"description", res.model_description},
+        {"reason",      res.model_choice_reason},
+        {"parameters",  model.parameter_count()},
+    };
+    nlohmann::json cands = nlohmann::json::array();
+    for (const auto& c : res.leaderboard) {
+        cands.push_back({
+            {"name",            c.name},
+            {"kind",            c.kind},
+            {"detail",          c.detail},
+            {"check_loss",      number_or_null(c.val_loss)},
+            {"check_score",     number_or_null(c.val_score)},
+            {"seconds",         c.seconds},
+            {"iterations",      c.iterations},
+            {"chosen",          c.chosen},
+            {"stopped_by_time", c.stopped_by_time},
+        });
+    }
+    j["candidates"] = std::move(cands);
+    j["rows"] = {
+        {"train",                res.n_train},
+        {"check",                res.n_val},
+        {"test",                 res.n_test},
+        {"skipped_blank_target", res.rows_dropped_missing_target},
+    };
+    j["evaluated_on"] = res.evaluated_on;
+    return j;
+}
+
+// ---------------------------------------------------------------------------
+// Wording
+// ---------------------------------------------------------------------------
+
+std::string make_summary(const AutoResult& r, bool is_cls) {
+    const std::string n = std::to_string(r.n_evaluated);
+    const std::string where = (r.evaluated_on == "test")
+        ? " on " + n + " rows held back from training"
+        : " on " + n + " check rows (too few rows to hold back a separate test set)";
+    std::string s = r.model_name + ": ";
+    if (is_cls) {
+        const auto& cm = std::get<eval::ClassificationMetrics>(r.metrics);
+        s += "accuracy " + fmt("%.1f%%", cm.accuracy * 100.0) + where;
+        for (const auto& b : r.baselines.baselines) {
+            if (b.name == "majority") {
+                s += " (always guessing the most common class: "
+                   + fmt("%.1f%%", b.primary_metric * 100.0) + ")";
+                break;
+            }
+        }
+    } else {
+        const auto& rm = std::get<eval::RegressionMetrics>(r.metrics);
+        s += "R\xc2\xb2 " + fmt("%.3f", rm.r2) + where
+           + " (typical error " + fmt("%.4g", rm.rmse) + ")";
+    }
+    s += ". " + r.baselines.verdict;
+    return s;
+}
+
+std::string evaluated_on_phrase(const AutoResult& r) {
+    if (r.evaluated_on == "test") {
+        return std::to_string(r.n_evaluated)
+             + " rows held back from training and from choosing the model";
+    }
+    return "the " + std::to_string(r.n_evaluated)
+         + " check rows, which were also used to choose the model (the file was "
+           "too small to hold back a separate test set), so these numbers are "
+           "slightly optimistic";
 }
 
 } // namespace
 
 // ---------------------------------------------------------------------------
-// run — the orchestrator. Each stage emits start/end progress, polls
-// cancel, and converts its native error type to util::Error.
+// run
 // ---------------------------------------------------------------------------
 
 util::Result<AutoResult>
@@ -768,313 +462,305 @@ run(const std::filesystem::path& csv,
     ProgressCb                   progress,
     CancelCb                     cancel) {
 
+    const auto t_start = Clock::now();
+    Reporter report(std::move(progress));
     AutoResult res;
 
-    // --- Stage 1: Scanning -------------------------------------------------
-    emit(progress, Stage::Scanning, 0.0, "Scanning dataset");
+    if (opts.do_export_bundle && opts.bundle_out_dir.empty()) {
+        return fail("Bundle write failed: bundle_out_dir is empty.");
+    }
+
+    // --- 1. Scanning -------------------------------------------------------
+    report(Stage::Scanning, 0.0, "Scanning the file");
     if (is_cancelled(cancel)) return fail("Cancelled by user.");
-
-    res.dq = dataqc::scan_csv(csv);
-    emit(progress, Stage::Scanning, 1.0, res.dq.summary_line);
-
+    {
+        dataqc::ScanOptions so;
+        so.target_column = target_column;
+        res.dq = dataqc::scan_csv(csv, so);
+    }
+    report(Stage::Scanning, 1.0, res.dq.summary_line);
     if (!res.dq.trainable) {
         std::string detail;
         for (const auto& f : res.dq.findings) {
-            if (f.severity == dataqc::Severity::Error) {
-                detail = f.message;
-                break;
-            }
+            if (f.severity == dataqc::Severity::Error) { detail = f.message; break; }
         }
-        return fail("Cannot train — " + (detail.empty() ? "data quality scan failed."
+        return fail("Cannot train — " + (detail.empty() ? std::string("the data quality scan failed.")
                                                         : detail));
     }
     if (is_cancelled(cancel)) return fail("Cancelled by user.");
 
-    // --- Stage 2: Preprocessing -------------------------------------------
-    emit(progress, Stage::Preprocessing, 0.0, "Fitting preprocessing pipeline");
-
+    // --- 2. Preprocessing ----------------------------------------------------
+    report(Stage::Preprocessing, 0.0, "Preparing the columns");
     preprocess::PipelineConfig pcfg;
-    pcfg.target_column = target_column;
-    pcfg.split_seed    = opts.seed;
-    // columns left empty triggers auto-spec inference inside fit_pipeline.
+    pcfg.target_column   = target_column;
+    pcfg.split_seed      = opts.seed;
+    pcfg.exclude_columns = opts.exclude_columns;
+    pcfg.task            = opts.task;
 
     preprocess::TransformedDataset ds;
     std::unique_ptr<preprocess::FittedPipeline> pipe;
     try {
         pipe = preprocess::fit_pipeline(csv, pcfg, ds);
     } catch (const std::exception& e) {
-        return fail(std::string("Pipeline fit failed: ") + e.what());
+        return fail(std::string("Cannot train — ") + e.what());
     }
-    if (!pipe) return fail("Pipeline fit failed: returned null pipeline.");
-    if (ds.X_train.empty() || ds.X_val.empty()) {
-        return fail("Pipeline fit failed: train or val split empty after fit.");
+    if (!pipe) return fail("Cannot train — the columns could not be prepared.");
+    if (ds.X_train.empty()) return fail("Cannot train — no rows left to learn from.");
+    if (ds.X_val.empty()) {
+        return fail("Cannot train — too few rows to hold some back for checking "
+                    "the model.");
     }
-    emit(progress, Stage::Preprocessing, 1.0, "Pipeline fitted");
+    res.columns                     = ds.columns;
+    res.rows_dropped_missing_target = ds.rows_dropped_missing_target;
+    res.n_train = static_cast<int>(ds.X_train.size());
+    res.n_val   = static_cast<int>(ds.X_val.size());
+    res.n_test  = static_cast<int>(ds.X_test.size());
+    report(Stage::Preprocessing, 1.0,
+           std::to_string(ds.feature_names_out.size()) + " model inputs from "
+           + std::to_string(res.columns.size()) + " columns");
     if (is_cancelled(cancel)) return fail("Cancelled by user.");
 
-    // --- Stage 3: AutoConfig ----------------------------------------------
-    emit(progress, Stage::AutoConfig, 0.0, "Selecting model configuration");
-    const bool is_cls   = ds.is_classification;
+    // --- 3. Set up -----------------------------------------------------------
+    const bool is_cls    = ds.is_classification;
     const int  n_classes = is_cls ? static_cast<int>(ds.class_labels.size()) : 0;
-    const int  iters     = iters_for_training(opts.time_budget_seconds);
-    const double lr      = is_cls ? 0.1 : 0.05;
-    emit(progress, Stage::AutoConfig, 1.0,
-         is_cls ? "Classification model selected" : "Regression model selected");
+    report(Stage::AutoConfig, 0.0, "Setting up");
+    models::TrainSet train_set =
+        make_train_set(is_cls, n_classes, ds.X_train, ds.y_train, ds.X_val, ds.y_val);
+    report(Stage::AutoConfig, 1.0,
+           is_cls ? "Predicting one of " + std::to_string(n_classes) + " classes"
+                  : std::string("Predicting a number"));
     if (is_cancelled(cancel)) return fail("Cancelled by user.");
 
-    // --- Stage 4: Training ------------------------------------------------
-    //
-    // P1-15 (final): the orchestrator now drives the real
-    // `training::TrainingEngine`. Network is built fresh per run with:
-    //   - Auto-allocated hidden layer (P1-18, ReLU + Glorot init).
-    //   - LINEAR output activation for cls (P1-17) so CrossEntropyLoss's
-    //     internal softmax sees raw logits with full gradient magnitude.
-    //   - Bounded self-organization (P1-16: max_neurons=256, per-cycle
-    //     fraction cap=10%) so the network can grow into hard examples
-    //     without blowing up wall time.
-    // The linear-probe `train_classification` / `train_regression`
-    // helpers below are retained for the learning-curve sub-runs only,
-    // where comparable shape under bounded wall time matters more than
-    // absolute accuracy.
-    emit(progress, Stage::Training, 0.0, "Training model");
-
-    SonTrainedModel                  son_model;
-    std::vector<std::vector<double>> val_probs;   // cls
-    std::vector<double>              val_yhat;    // reg
-    int    son_epochs_configured = epochs_from_budget(opts.time_budget_seconds);
-    std::size_t son_batch_size   = std::max<std::size_t>(
-        1, std::min<std::size_t>(16, ds.X_train.size() / 4));
-
+    // --- 4. Training ---------------------------------------------------------
+    report(Stage::Training, 0.0, "Training models");
+    const double budget = static_cast<double>(opts.time_budget_seconds);
+    models::AutoFitResult fit;
     try {
-        auto train_r = train_with_engine(
-            ds, is_cls, n_classes,
-            opts.time_budget_seconds, opts.seed,
-            progress, cancel);
-        if (!train_r.ok()) {
-            return fail(train_r.error().message);
-        }
-        son_model = std::move(train_r).value();
-
-        if (is_cls) {
-            val_probs = predict_with_engine_cls(*son_model.network, son_model, ds.X_val);
-            if (val_probs.empty()) {
-                return fail("Inference failed: could not re-attach IOManager "
-                            "for val-set prediction (saved IO neuron ids "
-                            "may be stale).");
-            }
-        } else {
-            val_yhat  = predict_with_engine_reg(*son_model.network, son_model, ds.X_val);
-            if (val_yhat.empty()) {
-                return fail("Inference failed: could not re-attach IOManager "
-                            "for val-set prediction.");
-            }
-        }
+        models::AutoFitOptions afo;
+        afo.time_budget_seconds = (budget > 0.0)
+            ? budget * (opts.do_learning_curve ? kTrainShareWithCurve : kTrainShareWithoutCurve)
+            : 0.0;
+        afo.seed     = opts.seed;
+        afo.thorough = opts.thorough;
+        fit = models::auto_fit(train_set, afo, cancel,
+                               [&](double f, const std::string& msg) {
+                                   report(Stage::Training, f, msg);
+                               });
     } catch (const std::exception& e) {
         return fail(std::string("Training failed: ") + e.what());
     }
-    emit(progress, Stage::Training, 1.0,
-         "Training complete — " + std::to_string(son_model.epochs_run) + " epochs, "
-         + std::to_string(son_model.network ? son_model.network->neuron_count() : 0)
-         + " neurons, "
-         + std::to_string(son_model.network ? son_model.network->synapse_count() : 0)
-         + " synapses");
-    if (is_cancelled(cancel)) return fail("Cancelled by user.");
-
-    // --- Stage 5: Evaluating ---------------------------------------------
-    emit(progress, Stage::Evaluating, 0.0, "Evaluating on val set");
-    if (is_cls) {
-        const auto y_val_idx = argmax_rows(ds.y_val);
-        eval::ClassificationMetrics cm;
-        try {
-            cm = eval::evaluate_classification(y_val_idx, val_probs, ds.class_labels);
-        } catch (const std::exception& e) {
-            return fail(std::string("Evaluation failed: ") + e.what());
-        }
-        res.metrics = cm;
-    } else {
-        const auto y_val_scalar = flatten_scalar(ds.y_val);
-        res.metrics = eval::evaluate_regression(y_val_scalar, val_yhat);
+    if (fit.cancelled || is_cancelled(cancel)) return fail("Cancelled by user.");
+    if (!fit.model) {
+        return fail("Training failed: none of the model types could be trained "
+                    "on this data.");
     }
-    emit(progress, Stage::Evaluating, 1.0, "Evaluation complete");
+    const models::Model& model = *fit.model;
+    res.leaderboard       = fit.leaderboard;
+    res.model_description = model.describe();
+    res.model_choice_reason = fit.choice_reason;
+    for (const auto& c : res.leaderboard) {
+        if (c.chosen) { res.model_name = c.name; res.check_score = c.val_score; }
+    }
+    report(Stage::Training, 1.0, "Chose " + res.model_name + ": " + res.model_description);
     if (is_cancelled(cancel)) return fail("Cancelled by user.");
 
-    // --- Stage 6: Baselining ---------------------------------------------
-    emit(progress, Stage::Baselining, 0.0, "Comparing against baselines");
-    {
-        // baselines module wants prob rows for cls and 1-element rows for reg.
-        std::vector<std::vector<double>> model_val_preds;
+    // --- 5. Evaluating -------------------------------------------------------
+    report(Stage::Evaluating, 0.0, "Measuring accuracy on held-back rows");
+    const bool have_test = !ds.X_test.empty();
+    const auto& X_eval_rows = have_test ? ds.X_test : ds.X_val;
+    const auto& y_eval_rows = have_test ? ds.y_test : ds.y_val;
+    res.evaluated_on = have_test ? "test" : "check";
+    res.n_evaluated  = static_cast<int>(X_eval_rows.size());
+
+    const models::Matrix X_eval = models::Matrix::from_rows(X_eval_rows);
+    const auto eval_preds = predict_rows(model, X_eval);
+    try {
         if (is_cls) {
-            model_val_preds = val_probs;
+            res.metrics = eval::evaluate_classification(argmax_rows(y_eval_rows),
+                                                        eval_preds, ds.class_labels);
         } else {
-            model_val_preds.reserve(val_yhat.size());
-            for (double y : val_yhat) model_val_preds.push_back({y});
+            res.metrics = eval::evaluate_regression(flatten_scalar(y_eval_rows),
+                                                    flatten_scalar(eval_preds));
         }
-        res.baselines = eval::compare_to_baselines(ds, model_val_preds, is_cls, opts.seed);
+    } catch (const std::exception& e) {
+        return fail(std::string("Evaluation failed: ") + e.what());
     }
-    emit(progress, Stage::Baselining, 1.0, res.baselines.verdict);
+    report(Stage::Evaluating, 0.4, "Measuring which columns matter");
+
+    // Importance on every held-back row (test and check together): more
+    // rows give a steadier ranking, and it describes the model rather
+    // than grading it.
+    {
+        std::vector<std::vector<double>> imp_rows = ds.X_test;
+        imp_rows.insert(imp_rows.end(), ds.X_val.begin(), ds.X_val.end());
+        std::vector<std::vector<double>> imp_y = ds.y_test;
+        imp_y.insert(imp_y.end(), ds.y_val.begin(), ds.y_val.end());
+        const models::Matrix X_imp = models::Matrix::from_rows(imp_rows);
+        res.importance = permutation_importance(
+            model, X_imp,
+            is_cls ? argmax_rows(imp_y) : std::vector<int>{},
+            is_cls ? std::vector<double>{} : flatten_scalar(imp_y),
+            ds.feature_sources, opts.seed ^ 0x1234567ull, cancel);
+    }
+    if (is_cancelled(cancel)) return fail("Cancelled by user.");
+    report(Stage::Evaluating, 1.0, "Evaluation complete");
+
+    // --- 6. Baselines (same rows as the scores) ------------------------------
+    report(Stage::Baselining, 0.0, "Comparing with simple guesses");
+    res.baselines = eval::compare_to_baselines(ds.X_train, ds.y_train,
+                                               X_eval_rows, y_eval_rows,
+                                               eval_preds, is_cls, opts.seed);
+    report(Stage::Baselining, 1.0, res.baselines.verdict);
     if (is_cancelled(cancel)) return fail("Cancelled by user.");
 
-    // --- Stage 7: Learning curve -----------------------------------------
+    // --- 7. Learning curve ---------------------------------------------------
+    // Retrains the chosen recipe on 25%, 50% and 75% of the training rows;
+    // the 100% point is the model already trained. Scored on the check rows.
     if (opts.do_learning_curve) {
-        emit(progress, Stage::LearningCurve, 0.0, "Computing learning curve");
-
-        // Build a TrainerFn that wraps our linear probe. Same trainer
-        // for every point so the curve is comparing apples to apples.
-        const int  curve_iters = std::max(20, iters / 4);
-        eval::TrainerFn trainer =
-            [is_cls, n_classes, lr, curve_iters](
-                const std::vector<std::vector<double>>& X_sub,
-                const std::vector<std::vector<double>>& y_sub,
-                const std::vector<std::vector<double>>& X_val,
-                const std::vector<std::vector<double>>& y_val,
-                int /*epochs*/, std::uint64_t /*seed*/) -> std::pair<double, double> {
-
-                if (is_cls) {
-                    auto y_sub_idx = argmax_rows(y_sub);
-                    auto y_val_idx = argmax_rows(y_val);
-                    auto m = train_classification(X_sub, y_sub_idx, n_classes,
-                                                  curve_iters, lr);
-                    auto train_probs = predict_classification(m, X_sub);
-                    auto val_probs2  = predict_classification(m, X_val);
-
-                    auto labels = std::vector<std::string>();
-                    labels.reserve(n_classes);
-                    for (int i = 0; i < n_classes; ++i)
-                        labels.push_back(std::to_string(i));
-
-                    const auto train_m = eval::evaluate_classification(
-                        y_sub_idx, train_probs, labels);
-                    const auto val_m   = eval::evaluate_classification(
-                        y_val_idx, val_probs2, labels);
-                    return { train_m.accuracy, val_m.accuracy };
-                }
-                auto y_sub_s = flatten_scalar(y_sub);
-                auto y_val_s = flatten_scalar(y_val);
-                auto m = train_regression(X_sub, y_sub_s, curve_iters, lr, 1e-4);
-                auto train_yhat = predict_regression(m, X_sub);
-                auto val_yhat2  = predict_regression(m, X_val);
-                const auto train_m = eval::evaluate_regression(y_sub_s, train_yhat);
-                const auto val_m   = eval::evaluate_regression(y_val_s, val_yhat2);
-                return { train_m.r2, val_m.r2 };
-            };
-
-        eval::LearningCurveConfig lcc;
-        lcc.seed             = opts.seed;
-        lcc.epochs_per_point = curve_iters;
-        res.curve = eval::compute_learning_curve(ds, is_cls, lcc, trainer);
-
-        emit(progress, Stage::LearningCurve, 1.0, res.curve.message);
-        if (is_cancelled(cancel)) return fail("Cancelled by user.");
-    } else {
-        emit(progress, Stage::LearningCurve, 1.0, "Learning curve skipped");
-    }
-
-    // --- Compose the one-line summary now that all metrics exist. ---------
-    {
-        const eval::ClassificationMetrics* cm =
-            std::get_if<eval::ClassificationMetrics>(&res.metrics);
-        const eval::RegressionMetrics*     rm =
-            std::get_if<eval::RegressionMetrics>(&res.metrics);
-        res.summary_one_liner = make_summary(is_cls, cm, rm, res.baselines);
-    }
-
-    // --- Stage 8: Packaging ----------------------------------------------
-    emit(progress, Stage::Packaging, 0.0, "Writing bundle");
-    if (opts.do_export_bundle) {
-        if (opts.bundle_out_dir.empty()) {
-            return fail("Bundle write failed: bundle_out_dir is empty.");
+        report(Stage::LearningCurve, 0.0, "Checking whether more data would help");
+        const double elapsed = seconds_since(t_start);
+        // 25% + 50% + 75% of one full fit, with some margin.
+        const double need = fit.refit_seconds * 1.5 * 1.2;
+        std::string skip;
+        if (!fit.refit) {
+            skip = "Skipped: the chosen model cannot be retrained on smaller samples.";
+        } else if (fit.refit_stopped_by_time) {
+            skip = "Skipped: training used its whole time allowance, so smaller "
+                   "samples cannot be compared fairly. Choose a longer training "
+                   "time to see this.";
+        } else if (budget > 0.0 && need > 1.0 && elapsed + need > budget) {
+            skip = "Skipped: not enough of the time allowance was left to retrain "
+                   "the model on smaller samples. Choose a longer training time "
+                   "to see this.";
         }
+
+        if (!skip.empty()) {
+            res.curve.message = skip;
+            report(Stage::LearningCurve, 1.0, skip);
+        } else {
+            const std::size_t n_full = ds.X_train.size();
+            const double full_train_score = models::evaluate_score(
+                model, train_set.X_train, train_set.y_train_cls, train_set.y_train_reg);
+            int points_done = 0;
+            eval::TrainerFn trainer =
+                [&](const std::vector<std::vector<double>>& X_sub,
+                    const std::vector<std::vector<double>>& y_sub,
+                    const std::vector<std::vector<double>>& X_v,
+                    const std::vector<std::vector<double>>& y_v,
+                    int /*epochs*/, std::uint64_t point_seed) -> std::pair<double, double> {
+                std::pair<double, double> scores{0.0, 0.0};
+                if (X_sub.size() == n_full) {
+                    // The chosen model was trained on exactly these rows.
+                    scores = {full_train_score, res.check_score};
+                } else if (!is_cancelled(cancel)) {
+                    const models::TrainSet t =
+                        make_train_set(is_cls, n_classes, X_sub, y_sub, X_v, y_v);
+                    models::FitControl c;
+                    c.seed      = point_seed;
+                    c.cancelled = cancel;
+                    if (budget > 0.0) {
+                        const double frac = static_cast<double>(X_sub.size())
+                                          / static_cast<double>(n_full);
+                        c.time_limit_seconds = std::max(1.0, fit.refit_seconds * 2.0 * frac + 0.5);
+                    }
+                    models::FitReport rep = fit.refit(t, c);
+                    if (rep.model) {
+                        scores = {models::evaluate_score(*rep.model, t.X_train,
+                                                         t.y_train_cls, t.y_train_reg),
+                                  models::evaluate_score(*rep.model, t.X_val,
+                                                         t.y_val_cls, t.y_val_reg)};
+                    }
+                }
+                ++points_done;
+                report(Stage::LearningCurve, points_done / 4.0,
+                       "Learning curve: " + std::to_string(X_sub.size()) + " rows");
+                return scores;
+            };
+            eval::LearningCurveConfig lcc;
+            lcc.seed = opts.seed;
+            try {
+                res.curve = eval::compute_learning_curve(ds, is_cls, lcc, trainer);
+            } catch (const std::exception& e) {
+                return fail(std::string("Learning curve failed: ") + e.what());
+            }
+            if (is_cancelled(cancel)) return fail("Cancelled by user.");
+            report(Stage::LearningCurve, 1.0, res.curve.message);
+        }
+    } else {
+        report(Stage::LearningCurve, 1.0, "Learning curve skipped");
+    }
+
+    res.summary_one_liner = make_summary(res, is_cls);
+
+    // --- 8. Packaging --------------------------------------------------------
+    report(Stage::Packaging, 0.0, "Writing the model files");
+    if (opts.do_export_bundle) {
         std::error_code ec;
         fs::create_directories(opts.bundle_out_dir, ec);
         if (ec) {
-            return fail("Bundle write failed: " + opts.bundle_out_dir.string()
+            return fail("Bundle write failed: " + to_utf8(opts.bundle_out_dir)
                         + ": " + ec.message());
         }
-
         const auto pipe_path     = opts.bundle_out_dir / kBundlePipeline;
         const auto model_path    = opts.bundle_out_dir / kBundleModel;
         const auto manifest_path = opts.bundle_out_dir / kBundleManifest;
         const auto card_path     = opts.bundle_out_dir / kBundleCard;
 
+        reporting::Manifest mf;
         try {
             preprocess::save_pipeline(*pipe, pipe_path);
-            // P1-15: write schema_v2 SON bundle. The runtime/bundle.cpp
-            // loader handles it via the neural_cls_v1 / neural_reg_v1
-            // kind dispatcher — predict.exe / DLL / wizard all share
-            // the same path now.
-            save_model_neural(son_model, is_cls, model_path);
-        } catch (const std::exception& e) {
-            return fail(std::string("Bundle write failed: ") + e.what());
-        }
-        emit(progress, Stage::Packaging, 0.5, "Pipeline + model written");
+            save_model_v3(model, is_cls, ds.class_labels, target_column, model_path);
+            report(Stage::Packaging, 0.5, "Model written");
 
-        // Manifest — hashes pipeline + model. Dataset is referenced by
-        // path on the input struct (see model card) but we don't copy
-        // the raw CSV into the bundle (privacy). Empty hash for dataset
-        // means verify_against will skip it.
-        reporting::Manifest mf;
-        mf.neurograph_version = "0.1.0";
-        mf.build_git_sha      = "";          // populated by CI when known
-        mf.dataset_sha256     = "";          // not tracked
-        try {
-            mf.pipeline_sha256 = reporting::sha256_of_file(pipe_path);
-            mf.model_sha256    = reporting::sha256_of_file(model_path);
-        } catch (const std::exception& e) {
-            return fail(std::string("Bundle write failed: ") + e.what());
-        }
-        mf.rng_seed         = opts.seed;
-        mf.timestamp_iso8601 = reporting::current_iso8601_utc();
-        reporting::populate_host_info(mf);
-        mf.pipeline_config = pipeline_config_to_json(pcfg);
-        mf.training_config = training_config_to_json_son(
-            son_model, opts.seed, son_epochs_configured, son_batch_size, is_cls);
-        try {
+            // The training CSV is not copied into the bundle (privacy), so
+            // its hash is left empty and verify_against skips it.
+            mf.neurograph_version = kVersion;
+            mf.build_git_sha      = "";
+            mf.dataset_sha256     = "";
+            mf.pipeline_sha256    = reporting::sha256_of_file(pipe_path);
+            mf.model_sha256       = reporting::sha256_of_file(model_path);
+            mf.rng_seed           = opts.seed;
+            mf.timestamp_iso8601  = reporting::current_iso8601_utc();
+            reporting::populate_host_info(mf);
+            mf.pipeline_config = pipeline_config_to_json(pcfg, res.columns);
+            mf.training_config = training_config_to_json(opts, res, model);
             reporting::save_manifest(mf, manifest_path);
-        } catch (const std::exception& e) {
-            return fail(std::string("Bundle write failed: ") + e.what());
-        }
 
-        // Model card. The reporting module wants a SupervisedConfig
-        // and pointers into the metrics variant — feed it placeholder
-        // values that match what the linear probe actually did.
-        reporting::ModelCardInputs mc;
-        mc.model_name             = "Auto-trained model";
-        mc.task_kind              = is_cls ? "classification" : "regression";
-        mc.dq_report              = res.dq;
-        mc.pipe_config            = pcfg;
-        mc.train_config                       = training::SupervisedConfig{};
-        mc.train_config.epochs                = son_epochs_configured;
-        mc.train_config.batch_size            = son_batch_size;
-        mc.train_config.optimizer_name        = "adam";
-        mc.train_config.optimizer_config.learning_rate = 0.01;
-        mc.train_config.loss_type             = is_cls
-            ? training::LossType::CROSS_ENTROPY
-            : training::LossType::MSE;
-        mc.train_config.interleave_self_org   = is_cls;
-        mc.train_config.self_org_interval     = 10;
-        mc.train_config.self_org_growth_only  = true;
-        if (is_cls) {
-            mc.cls_metrics = std::get_if<eval::ClassificationMetrics>(&res.metrics);
-        } else {
-            mc.reg_metrics = std::get_if<eval::RegressionMetrics>(&res.metrics);
-        }
-        mc.baseline             = res.baselines;
-        mc.curve                = res.curve;
-        mc.neurograph_version   = mf.neurograph_version;
-        mc.generated_at_iso8601 = mf.timestamp_iso8601;
-        mc.dataset_path         = csv.string();
-        try {
+            reporting::ModelCardInputs mc;
+            mc.model_name           = "Model predicting '" + target_column + "'";
+            mc.task_kind            = is_cls ? "classification" : "regression";
+            mc.dq_report            = res.dq;
+            mc.pipe_config          = pcfg;
+            if (is_cls) mc.cls_metrics = std::get_if<eval::ClassificationMetrics>(&res.metrics);
+            else        mc.reg_metrics = std::get_if<eval::RegressionMetrics>(&res.metrics);
+            mc.baseline             = res.baselines;
+            mc.curve                = res.curve;
+            mc.neurograph_version   = mf.neurograph_version;
+            mc.generated_at_iso8601 = mf.timestamp_iso8601;
+            mc.dataset_path         = to_utf8(csv.filename());
+            mc.model_description    = res.model_description;
+            mc.model_choice_reason  = res.model_choice_reason;
+            mc.candidates           = res.leaderboard;
+            mc.columns              = res.columns;
+            for (const auto& ci : res.importance) {
+                mc.importance.push_back({ci.column, ci.relative, ci.score_drop});
+            }
+            mc.evaluated_on = evaluated_on_phrase(res);
+            mc.n_train = res.n_train;
+            mc.n_val   = res.n_val;
+            mc.n_test  = res.n_test;
+            mc.rows_dropped_missing_target = res.rows_dropped_missing_target;
             reporting::save_model_card(mc, card_path);
         } catch (const std::exception& e) {
             return fail(std::string("Bundle write failed: ") + e.what());
         }
-        emit(progress, Stage::Packaging, 1.0, "Bundle written: " + opts.bundle_out_dir.string());
         res.bundle_path = opts.bundle_out_dir;
+        report(Stage::Packaging, 1.0, "Saved to " + to_utf8(opts.bundle_out_dir));
     } else {
-        emit(progress, Stage::Packaging, 1.0, "Bundle export skipped");
+        report(Stage::Packaging, 1.0, "Bundle export skipped");
     }
 
-    emit(progress, Stage::Done, 1.0, res.summary_one_liner);
+    report(Stage::Done, 1.0, res.summary_one_liner);
     return res;
 }
 

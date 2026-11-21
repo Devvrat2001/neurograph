@@ -12,19 +12,9 @@ namespace neurograph::workbench {
 
 namespace {
 
-// Table of finding codes the preprocessor knows how to auto-fix. If
-// you add a new remedy to the pipeline builder, add the code here or
-// the wizard's "Fix automatically" checkbox will stay disabled.
-//
-// Kept as a free function rather than a std::unordered_set because
-// the list is tiny and a linear scan at UI-render speed is cheaper
-// than hashing a 20-char string.
-bool is_fixable_code(std::string_view code) {
-    return code == "MISSING_VALUES"
-        || code == "CONSTANT_COLUMN"
-        || code == "DUPLICATE_ROWS"
-        || code == "HIGH_CARDINALITY"
-        || code == "OUTLIERS";
+void clear_plan(WizardState& s) {
+    s.column_plan.clear();
+    s.column_plan_error.clear();
 }
 
 } // namespace
@@ -36,14 +26,12 @@ bool is_fixable_code(std::string_view code) {
 std::string can_advance(const WizardState& s) {
     switch (s.current_step) {
         case WizardStep::Load:
+            // The UI shows these next to the greyed-out Next button.
             if (!s.csv) {
-                // User hasn't dropped a file yet. The UI greys the
-                // button; this message isn't normally displayed, but
-                // keeps the contract honest for headless callers.
-                return "Load a CSV file to continue.";
+                return "Choose a CSV file to continue.";
             }
             if (s.target_column.empty()) {
-                return "Pick a target column to continue.";
+                return "Choose the column to predict.";
             }
             // Defense-in-depth: default_target_column should have
             // already picked a column, but if someone cleared it
@@ -51,16 +39,16 @@ std::string can_advance(const WizardState& s) {
             {
                 const auto& cols = s.csv->columns;
                 if (std::find(cols.begin(), cols.end(), s.target_column) == cols.end()) {
-                    return "Selected target column is not in this file.";
+                    return "The column to predict is not in this file.";
                 }
             }
             return "";
         case WizardStep::Quality:
             if (!s.dq_report) {
-                return "Data quality report missing.";
+                return "The data check has not run yet.";
             }
             if (has_blocking_error(s)) {
-                return "Fix the blocking data quality error to continue.";
+                return "Fix the blocking problem to continue.";
             }
             return "";
         case WizardStep::Train:
@@ -69,11 +57,11 @@ std::string can_advance(const WizardState& s) {
             // success — this guard catches "user hit Next after a
             // failure" etc.
             if (s.status.load() != TrainingStatus::Succeeded) {
-                return "Training must finish successfully before viewing results.";
+                return "Train a model to see its results.";
             }
             return "";
         case WizardStep::Results:
-            return "Already on the last step.";
+            return "This is the last step.";
     }
     return "";   // unreachable; GCC wants the terminator
 }
@@ -121,7 +109,8 @@ void reset_to_load(WizardState& s) {
     s.target_column.clear();
     s.load_error.clear();
     s.dq_report.reset();
-    s.auto_fixes_applied.clear();
+    clear_plan(s);
+    s.excluded_columns.clear();
     s.status.store(TrainingStatus::Idle);
     s.cancel_requested.store(false);
     {
@@ -164,7 +153,8 @@ void set_csv(WizardState& s, CsvMetadata meta) {
     s.target_column = default_target_column(meta);
     s.csv = std::move(meta);
     s.dq_report.reset();
-    s.auto_fixes_applied.clear();
+    clear_plan(s);
+    s.excluded_columns.clear();
     s.status.store(TrainingStatus::Idle);
     s.error_message.clear();
     s.result.reset();
@@ -174,7 +164,8 @@ void clear_csv(WizardState& s) {
     s.csv.reset();
     s.target_column.clear();
     s.dq_report.reset();
-    s.auto_fixes_applied.clear();
+    clear_plan(s);
+    s.excluded_columns.clear();
     s.status.store(TrainingStatus::Idle);
     s.error_message.clear();
     s.result.reset();
@@ -185,11 +176,11 @@ bool set_target_column(WizardState& s, std::string col) {
     const auto& cols = s.csv->columns;
     if (std::find(cols.begin(), cols.end(), col) == cols.end()) return false;
     s.target_column = std::move(col);
-    // Changing the target invalidates the DQ report — class
-    // imbalance / leakage columns were computed against a different
-    // target.
+    // Changing the target invalidates the DQ report (class imbalance and
+    // leakage are measured against the target) and the column plan.
+    s.excluded_columns.erase(s.target_column);
     s.dq_report.reset();
-    s.auto_fixes_applied.clear();
+    clear_plan(s);
     return true;
 }
 
@@ -199,27 +190,25 @@ bool set_target_column(WizardState& s, std::string col) {
 
 void set_dq_report(WizardState& s, dataqc::DataQualityReport report) {
     s.dq_report = std::move(report);
-    s.auto_fixes_applied.clear();
 }
 
-bool fix_is_applicable(const dataqc::Finding& f) {
-    return is_fixable_code(f.code);
+bool toggle_excluded_column(WizardState& s, const std::string& column) {
+    if (!s.csv || column == s.target_column) return false;
+    const auto& cols = s.csv->columns;
+    if (std::find(cols.begin(), cols.end(), column) == cols.end()) return false;
+    if (s.excluded_columns.erase(column) > 0) return false;
+    s.excluded_columns.insert(column);
+    return true;
 }
 
-bool toggle_fix(WizardState& s, const std::string& finding_code) {
-    // Ignore codes we can't actually fix — the UI would also refuse
-    // to offer the checkbox, but a scripted caller might try.
-    if (!is_fixable_code(finding_code)) {
-        auto it = s.auto_fixes_applied.find(finding_code);
-        return it != s.auto_fixes_applied.end();
-    }
-    auto it = s.auto_fixes_applied.find(finding_code);
-    if (it == s.auto_fixes_applied.end()) {
-        s.auto_fixes_applied.insert(finding_code);
-        return true;
-    }
-    s.auto_fixes_applied.erase(it);
-    return false;
+bool is_excluded(const WizardState& s, const std::string& column) {
+    return s.excluded_columns.count(column) > 0;
+}
+
+void set_task_override(WizardState& s, TaskOverride t) {
+    if (s.task_override == t) return;
+    s.task_override = t;
+    clear_plan(s);
 }
 
 bool has_blocking_error(const WizardState& s) {
@@ -244,14 +233,21 @@ orchestration::AutoOptions build_options(const WizardState& s,
                                          std::filesystem::path bundle_dir) {
     orchestration::AutoOptions opts;
     opts.time_budget_seconds = time_budget_seconds(s.time_budget);
-    // The "Best quality" budget is the only one where a learning
-    // curve is worth the extra time; under Quick / Balanced we skip
-    // it to stay inside budget.
-    opts.do_learning_curve   = (s.time_budget == TimeBudget::Best);
+    // The learning curve retrains the chosen model on 25/50/75% of the
+    // rows (about 1.5x the cost of the model itself, and skipped when the
+    // budget cannot cover it). Worth it except on Quick.
+    opts.do_learning_curve   = (s.time_budget != TimeBudget::Quick);
+    opts.thorough            = (s.time_budget == TimeBudget::Best);
     opts.do_export_bundle    = true;
     opts.bundle_out_dir      = std::move(bundle_dir);
-    // Seed stays at the orchestrator default (42) — the wizard does
-    // not expose this knob today. Advanced panel can override later.
+    opts.exclude_columns.assign(s.excluded_columns.begin(), s.excluded_columns.end());
+    switch (s.task_override) {
+        case TaskOverride::Auto:           opts.task = preprocess::TaskChoice::Auto;           break;
+        case TaskOverride::Classification: opts.task = preprocess::TaskChoice::Classification; break;
+        case TaskOverride::Regression:     opts.task = preprocess::TaskChoice::Regression;     break;
+    }
+    // Seed stays at the orchestrator default (42), so the same file and
+    // choices give the same model.
     return opts;
 }
 
@@ -304,9 +300,9 @@ const char* step_label(WizardStep s) {
 
 const char* time_budget_label(TimeBudget b) {
     switch (b) {
-        case TimeBudget::Quick:    return "Quick (~30 s)";
-        case TimeBudget::Balanced: return "Balanced (~5 min)";
-        case TimeBudget::Best:     return "Best quality (~30 min)";
+        case TimeBudget::Quick:    return "Quick (up to 30 s)";
+        case TimeBudget::Balanced: return "Balanced (up to 5 min)";
+        case TimeBudget::Best:     return "Best quality (up to 30 min, tries larger models)";
     }
     return "?";
 }

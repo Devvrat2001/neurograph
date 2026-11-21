@@ -44,9 +44,17 @@ struct BaselineReport {
     std::vector<BaselineResult> baselines;        // one entry per baseline
     double                      model_primary         = 0.0;
     double                      model_secondary       = 0.0;
-    /// model_primary − max(baseline.primary_metric).
-    /// Positive means the model beats every baseline. Drives `verdict`.
+    /// model_primary − max(baseline.primary_metric), the linear probe
+    /// included. Positive means the model beats every baseline.
     double                      lift_vs_best_baseline = 0.0;
+    /// model_primary − the better of the two trivial baselines (majority
+    /// or mean, and random). Positive means the model learned something.
+    /// This, not lift_vs_best_baseline, decides whether the verdict says
+    /// "not learning": matching a straight-line model is not failure.
+    double                      lift_vs_trivial       = 0.0;
+    /// True when the straight-line probe scores within one point of the
+    /// model, i.e. the pattern in the data is mostly linear.
+    bool                        linear_is_enough      = false;
     /// One-sentence plain-English summary the wizard shows the user.
     std::string                 verdict;
 };
@@ -73,6 +81,20 @@ struct BaselineReport {
 BaselineReport compare_to_baselines(
     const preprocess::TransformedDataset&    ds,
     const std::vector<std::vector<double>>&  model_val_preds,
+    bool                                     is_classification,
+    std::uint64_t                            seed = 1234567ull);
+
+/// The same comparison on explicit rows. Baselines learn from
+/// (X_train, y_train) and everything is scored on (X_eval, y_eval); the
+/// orchestrator passes the untouched test rows here. `y_*` rows are
+/// one-hot (classification) or one value (regression), as in
+/// TransformedDataset.
+BaselineReport compare_to_baselines(
+    const std::vector<std::vector<double>>&  X_train,
+    const std::vector<std::vector<double>>&  y_train,
+    const std::vector<std::vector<double>>&  X_eval,
+    const std::vector<std::vector<double>>&  y_eval,
+    const std::vector<std::vector<double>>&  model_eval_preds,
     bool                                     is_classification,
     std::uint64_t                            seed = 1234567ull);
 

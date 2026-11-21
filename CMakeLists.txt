@@ -1,19 +1,38 @@
 cmake_minimum_required(VERSION 3.25)
-project(neurograph VERSION 0.1.0 LANGUAGES C CXX CUDA)
+project(neurograph VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-# Default CUDA architecture: Ampere (RTX 3050/3060/3070/3080)
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 86)
-endif()
+# One version string for the whole product: bundle manifests, the C API,
+# and the command-line tools' --version all read it from here.
+add_compile_definitions(NEUROGRAPH_VERSION_STRING="${PROJECT_VERSION}")
 
 # --- Options ---
 option(NEUROGRAPH_BUILD_TESTS "Build unit and integration tests" ON)
+
+# The product (wizard, trainer, predict, runtime DLL) runs on the CPU and
+# needs no GPU toolkit. The CUDA kernels belong to the experimental
+# graph engine and its demo program; switch this on only to work on those.
+option(NEUROGRAPH_ENABLE_CUDA
+       "Build the experimental CUDA kernels and the `neurograph` demo exe"
+       OFF)
+
+if(NEUROGRAPH_ENABLE_CUDA)
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    # Default CUDA architecture: Ampere (RTX 3050/3060/3070/3080)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES 86)
+    endif()
+    # Executables that link the CUDA static lib need one .cu translation
+    # unit so CMake resolves device symbols at link time.
+    set(NEUROGRAPH_CUDA_LINK_STUB ${CMAKE_SOURCE_DIR}/src/cuda_link_stub.cu)
+else()
+    set(NEUROGRAPH_CUDA_LINK_STUB "")
+endif()
 option(NEUROGRAPH_ENABLE_COVERAGE
        "Add coverage targets via OpenCppCoverage (Windows/MSVC, Debug build)"
        OFF)
@@ -129,30 +148,64 @@ function(neurograph_attach_asan_runtime target)
     endif()
 endfunction()
 
+# Helper used by exe targets: put the vcpkg runtime DLLs (spdlog, fmt,
+# libsodium, ...) next to the exe so it starts from the build folder.
+# Only needed with vcpkg-toolchain.cmake; the full vcpkg toolchain has
+# its own step for this.
+#
+# One copy target per output directory, which every exe in that
+# directory depends on. That way the DLLs are copied once, before any
+# exe is linked or run (test discovery runs the test exe at build time),
+# and parallel builds never write the same file from two projects.
+function(neurograph_copy_runtime_dlls target)
+    if(NOT (WIN32 AND NEUROGRAPH_COPY_VCPKG_DLLS))
+        return()
+    endif()
+    get_target_property(_bin_dir ${target} BINARY_DIR)
+    string(MD5 _tag "${_bin_dir}")
+    string(SUBSTRING "${_tag}" 0 8 _tag)
+    set(_copy_target "neurograph_runtime_dlls_${_tag}")
+    if(NOT TARGET ${_copy_target})
+        set(_root "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
+        file(GLOB _rel "${_root}/bin/*.dll")
+        file(GLOB _dbg "${_root}/debug/bin/*.dll")
+        add_custom_target(${_copy_target}
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${_bin_dir}/$<CONFIG>"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<IF:$<CONFIG:Debug>,${_dbg},${_rel}>"
+                "${_bin_dir}/$<CONFIG>"
+            COMMAND_EXPAND_LISTS
+            COMMENT "Copy vcpkg runtime DLLs to ${_bin_dir}/$<CONFIG>")
+    endif()
+    add_dependencies(${target} ${_copy_target})
+endfunction()
+
 # --- Dependencies via vcpkg ---
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(unofficial-sodium CONFIG REQUIRED)
 find_package(CURL CONFIG REQUIRED)
 
-# --- CUDA Kernels Library ---
-add_library(neurograph_cuda STATIC
-    cuda/kernels/activate_neurons.cu
-    cuda/kernels/propagate_signals.cu
-    cuda/kernels/hebbian_update.cu
-    cuda/kernels/normalize_weights.cu
-    cuda/kernels/compute_affinity.cu
-)
+# --- CUDA Kernels Library (experimental, optional) ---
+if(NEUROGRAPH_ENABLE_CUDA)
+    add_library(neurograph_cuda STATIC
+        cuda/kernels/activate_neurons.cu
+        cuda/kernels/propagate_signals.cu
+        cuda/kernels/hebbian_update.cu
+        cuda/kernels/normalize_weights.cu
+        cuda/kernels/compute_affinity.cu
+    )
 
-target_include_directories(neurograph_cuda PUBLIC
-    ${CMAKE_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/cuda
-)
+    target_include_directories(neurograph_cuda PUBLIC
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/cuda
+    )
 
-set_target_properties(neurograph_cuda PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-    POSITION_INDEPENDENT_CODE ON
-)
+    set_target_properties(neurograph_cuda PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        POSITION_INDEPENDENT_CODE ON
+    )
+endif()
 
 # --- Main Library ---
 add_library(neurograph_lib STATIC
@@ -200,18 +253,30 @@ add_library(neurograph_lib STATIC
     src/licensing/license_revocation.cpp
     src/orchestration/auto_pipeline.cpp
     src/runtime/bundle.cpp
+    src/runtime/score.cpp
     src/workbench/wizard/wizard_state.cpp
     src/workbench/wizard/csv_preview.cpp
     src/dataqc/scanner.cpp
     src/preprocess/transforms.cpp
     src/preprocess/pipeline.cpp
-    src/gpu/device_network.cu
+    # Native model families + automatic selection (linear, dense network
+    # that grows its hidden layer, gradient-boosted trees, blends).
+    src/models/model.cpp
+    src/models/mlp.cpp
+    src/models/gbt.cpp
+    src/models/automl.cpp
 )
 
 target_include_directories(neurograph_lib PUBLIC
     ${CMAKE_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/cuda
 )
+
+if(NEUROGRAPH_ENABLE_CUDA)
+    target_sources(neurograph_lib PRIVATE src/gpu/device_network.cu)
+    target_include_directories(neurograph_lib PUBLIC ${CMAKE_SOURCE_DIR}/cuda)
+    target_link_libraries(neurograph_lib PUBLIC neurograph_cuda)
+    target_compile_definitions(neurograph_lib PUBLIC NEUROGRAPH_HAS_CUDA=1)
+endif()
 
 # Prevent Windows min/max macro conflicts with std::min/std::max
 if(WIN32)
@@ -223,7 +288,6 @@ target_link_libraries(neurograph_lib PUBLIC
     spdlog::spdlog
     unofficial-sodium::sodium
     CURL::libcurl
-    neurograph_cuda
 )
 
 # Winsock2 for networking on Windows
@@ -239,21 +303,24 @@ set_target_properties(neurograph_lib PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
-# --- Executable ---
-add_executable(neurograph src/main.cpp src/cuda_link_stub.cu)
-target_link_libraries(neurograph PRIVATE neurograph_lib)
-# Use CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES (set automatically by CMake CUDA language support)
-target_include_directories(neurograph PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-set_target_properties(neurograph PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-    CUDA_RESOLVE_DEVICE_SYMBOLS ON
-)
-neurograph_attach_asan_runtime(neurograph)
+# --- Experimental demo executable (walks the graph engine on the GPU) ---
+if(NEUROGRAPH_ENABLE_CUDA)
+    add_executable(neurograph src/main.cpp ${NEUROGRAPH_CUDA_LINK_STUB})
+    target_link_libraries(neurograph PRIVATE neurograph_lib)
+    # Use CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES (set automatically by CMake CUDA language support)
+    target_include_directories(neurograph PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    set_target_properties(neurograph PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    )
+    neurograph_attach_asan_runtime(neurograph)
+    neurograph_copy_runtime_dlls(neurograph)
+endif()
 
 # --- Predict CLI (P1-07) ---
 add_executable(neurograph_predict
     src/runtime/predict_main.cpp
-    src/cuda_link_stub.cu
+    ${NEUROGRAPH_CUDA_LINK_STUB}
 )
 target_link_libraries(neurograph_predict PRIVATE neurograph_lib)
 target_include_directories(neurograph_predict PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -262,6 +329,19 @@ set_target_properties(neurograph_predict PROPERTIES
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 neurograph_attach_asan_runtime(neurograph_predict)
+neurograph_copy_runtime_dlls(neurograph_predict)
+
+# --- Command-line trainer ---
+#
+# The wizard's Train button without the GUI: CSV in, bundle out. Used for
+# scripting, servers without a desktop, and the accuracy benchmarks.
+add_executable(neurograph_train
+    src/cli/train_main.cpp
+    ${NEUROGRAPH_CUDA_LINK_STUB}
+)
+target_link_libraries(neurograph_train PRIVATE neurograph_lib)
+neurograph_attach_asan_runtime(neurograph_train)
+neurograph_copy_runtime_dlls(neurograph_train)
 
 # --- C ABI shared library (P1-08) ---
 #
@@ -273,7 +353,7 @@ neurograph_attach_asan_runtime(neurograph_predict)
 # and the shared library inherits that dependency.
 add_library(neurograph_rt SHARED
     src/capi/neurograph_rt.cpp
-    src/cuda_link_stub.cu
+    ${NEUROGRAPH_CUDA_LINK_STUB}
 )
 target_link_libraries(neurograph_rt PRIVATE neurograph_lib)
 target_include_directories(neurograph_rt PUBLIC
@@ -300,6 +380,7 @@ target_include_directories(neurograph_capi_example PRIVATE
     ${CMAKE_SOURCE_DIR}/include
 )
 neurograph_attach_asan_runtime(neurograph_capi_example)
+neurograph_copy_runtime_dlls(neurograph_capi_example)
 
 # --- License keygen CLI (P1-11, ops-only) ---
 #
@@ -311,42 +392,79 @@ neurograph_attach_asan_runtime(neurograph_capi_example)
 add_executable(neurograph_keygen src/licensing/license_keygen_main.cpp)
 target_link_libraries(neurograph_keygen PRIVATE neurograph_lib)
 neurograph_attach_asan_runtime(neurograph_keygen)
+neurograph_copy_runtime_dlls(neurograph_keygen)
 
 # --- Workbench (ImGui + DirectX 11) ---
 find_package(imgui CONFIG REQUIRED)
 
-add_executable(neurograph_workbench WIN32
-    src/workbench/workbench_app.cpp
-    # P1-09 wizard UI. State + csv_preview translation units already
-    # live in neurograph_lib so the unit tests can link them without
-    # pulling ImGui in; only the render layer is workbench-only.
+# The ImGui-bound wizard screens and the theme. The wizard state and
+# csv_preview live in neurograph_lib so the unit tests can link them
+# without ImGui; this library is shared by the workbench, the render
+# perf test and the snapshot tool.
+add_library(neurograph_workbench_ui STATIC
+    src/workbench/theme.cpp
     src/workbench/wizard/wizard_ui.cpp
     src/workbench/wizard/step_load.cpp
     src/workbench/wizard/step_quality.cpp
     src/workbench/wizard/step_train.cpp
     src/workbench/wizard/step_results.cpp
+    src/workbench/wizard/native_dialogs.cpp
+)
+target_link_libraries(neurograph_workbench_ui PUBLIC
+    neurograph_lib
+    imgui::imgui
+    # File dialogs (COM) and shell helpers.
+    ole32
+    shell32
+    uuid
+)
+# The step .cpp files and their users include "wizard_ui.hpp" and
+# "theme.hpp" with no relative qualifier.
+target_include_directories(neurograph_workbench_ui PUBLIC
+    ${CMAKE_SOURCE_DIR}/src/workbench
+    ${CMAKE_SOURCE_DIR}/src/workbench/wizard
+)
+
+add_executable(neurograph_workbench WIN32
+    src/workbench/workbench_app.cpp
     # P1-11 license dialog -- ImGui-bound, so workbench-only. The
     # crypto/persistence/trial logic lives in neurograph_lib.
     src/workbench/license_dialog.cpp
-    src/cuda_link_stub.cu
+    ${NEUROGRAPH_CUDA_LINK_STUB}
 )
 target_link_libraries(neurograph_workbench PRIVATE
-    neurograph_lib
-    imgui::imgui
+    neurograph_workbench_ui
     d3d11
     dxgi
 )
 target_include_directories(neurograph_workbench PRIVATE
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
-    # The wizard step .cpp files include "wizard_ui.hpp" with no
-    # relative qualifier; add the wizard directory so that resolves.
-    ${CMAKE_SOURCE_DIR}/src/workbench/wizard
 )
 set_target_properties(neurograph_workbench PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 neurograph_attach_asan_runtime(neurograph_workbench)
+neurograph_copy_runtime_dlls(neurograph_workbench)
+
+# Pictures of each wizard step, drawn off-screen with the workbench's
+# own step renderers, fonts and colours (Direct3D 11, no window). For
+# checking the screens without starting the app.
+add_executable(neurograph_wizard_snapshots
+    tools/wizard_snapshots/wizard_snapshots.cpp
+    ${NEUROGRAPH_CUDA_LINK_STUB}
+)
+target_link_libraries(neurograph_wizard_snapshots PRIVATE
+    neurograph_workbench_ui
+    d3d11
+    windowscodecs
+)
+set_target_properties(neurograph_wizard_snapshots PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+neurograph_attach_asan_runtime(neurograph_wizard_snapshots)
+neurograph_copy_runtime_dlls(neurograph_wizard_snapshots)
 
 # --- Tests ---
 if(NEUROGRAPH_BUILD_TESTS)

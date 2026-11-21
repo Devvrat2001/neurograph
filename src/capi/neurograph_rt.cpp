@@ -13,6 +13,7 @@
 //     const state from the bundle.
 
 #define NEUROGRAPH_RT_BUILDING 1
+#include "neurograph/version.hpp"
 #include "neurograph/capi/neurograph_rt.h"
 
 #include "neurograph/runtime/bundle.hpp"
@@ -146,21 +147,7 @@ NG_EXPORT void ng_model_free(ng_model* m) {
 
 NG_EXPORT int ng_model_num_features(const ng_model* m) {
     if (!m) return 0;
-    const auto& bundle = as_impl(m)->bundle;
-    if (const auto* c = std::get_if<neurograph::runtime::LinearClassificationModel>(&bundle.model)) {
-        return c->n_features;
-    }
-    if (const auto* r = std::get_if<neurograph::runtime::LinearRegressionModel>(&bundle.model)) {
-        return r->n_features;
-    }
-    // P1-15: SON variants. Same metadata field on both alternatives.
-    if (const auto* nc = std::get_if<neurograph::runtime::NeuralNetClassificationModel>(&bundle.model)) {
-        return nc->n_features;
-    }
-    if (const auto* nr = std::get_if<neurograph::runtime::NeuralNetRegressionModel>(&bundle.model)) {
-        return nr->n_features;
-    }
-    return 0;
+    return as_impl(m)->bundle.n_features();
 }
 
 NG_EXPORT int ng_model_num_classes(const ng_model* m) {
@@ -179,6 +166,10 @@ NG_EXPORT const char* ng_model_class_label(const ng_model* m, int idx) {
     if (const auto* nc = std::get_if<neurograph::runtime::NeuralNetClassificationModel>(&bundle.model)) {
         if (idx < 0 || idx >= static_cast<int>(nc->class_labels.size())) return nullptr;
         return nc->class_labels[idx].c_str();
+    }
+    if (const auto* nm = std::get_if<neurograph::runtime::NativeModel>(&bundle.model)) {
+        if (idx < 0 || idx >= static_cast<int>(nm->class_labels.size())) return nullptr;
+        return nm->class_labels[idx].c_str();
     }
     return nullptr;
 }
@@ -360,8 +351,7 @@ NG_EXPORT const char* ng_last_error(void) {
 }
 
 NG_EXPORT const char* ng_rt_version(void) {
-    // Match the project() VERSION in the top-level CMakeLists.
-    return "0.1.0";
+    return neurograph::kVersion;
 }
 
 } // extern "C"

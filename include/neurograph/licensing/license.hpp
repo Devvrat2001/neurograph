@@ -248,4 +248,9 @@ is_revoked(const std::string& key,
            const std::string& endpoint = "https://licensing.neurograph.ai/v1/check",
            std::chrono::milliseconds timeout = std::chrono::milliseconds(2000));
 
+/// True when this build carries a real vendor public key. With the
+/// zero-filled placeholder no key can ever verify, so the application
+/// must not lock anyone out: it runs unlicensed with every feature on.
+bool licensing_configured();
+
 } // namespace neurograph::licensing

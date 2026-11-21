@@ -96,6 +96,7 @@ ModelCardInputs make_cls_inputs() {
     in.baseline.model_primary         = 0.87;
     in.baseline.model_secondary       = 0.82;
     in.baseline.lift_vs_best_baseline = 0.08;
+    in.baseline.lift_vs_trivial       = 0.25;
     in.baseline.verdict =
         "Good result — model beats baselines by a meaningful margin.";
 
@@ -149,6 +150,7 @@ ModelCardInputs make_reg_inputs() {
     in.baseline.model_primary         = 0.91;
     in.baseline.model_secondary       = 111.8;
     in.baseline.lift_vs_best_baseline = 0.21;
+    in.baseline.lift_vs_trivial       = 0.91;
     in.baseline.verdict =
         "Strong result — model is substantially better than simple baselines.";
 
@@ -305,6 +307,7 @@ TEST(ModelCard, LimitationsMentionImprovingCurve) {
 TEST(ModelCard, LimitationsMentionBaselineLossWhenNotLearning) {
     auto in = make_cls_inputs();
     in.baseline.lift_vs_best_baseline = -0.05;
+    in.baseline.lift_vs_trivial       = -0.05;
     const auto md = render_model_card(in);
     EXPECT_TRUE(contains(md, "does not currently outperform a trivial baseline"));
 }

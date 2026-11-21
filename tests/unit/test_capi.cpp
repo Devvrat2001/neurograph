@@ -19,6 +19,7 @@
 // same either way.
 
 #define NEUROGRAPH_RT_STATIC 1
+#include "neurograph/version.hpp"
 #include "neurograph/capi/neurograph_rt.h"
 
 #include "neurograph/orchestration/auto_pipeline.hpp"
@@ -126,7 +127,7 @@ TEST_F(CapiTest, LoadClassificationBundleAndReadMetadata) {
     EXPECT_NE(ng_model_class_label(m, 0), nullptr);
     EXPECT_NE(ng_model_class_label(m, 1), nullptr);
     EXPECT_EQ(ng_model_class_label(m, 99), nullptr);   // out of range
-    EXPECT_STREQ(ng_model_version(m), "0.1.0");
+    EXPECT_STREQ(ng_model_version(m), neurograph::kVersion);
 
     ng_model_free(m);
 }

@@ -152,7 +152,7 @@ TEST(Baselines, ConstantTargetTriggersNotLearningVerdict) {
 
     // Single-class val triggers the dedicated verdict before any baselines
     // run — the spec calls for that exact string.
-    EXPECT_EQ(r.verdict, "Cannot evaluate — val set has only one class.");
+    EXPECT_EQ(r.verdict, "Cannot evaluate — the held-back rows all have the same class.");
 }
 
 // ---------------------------------------------------------------------------
@@ -173,7 +173,7 @@ TEST(Baselines, SingleClassValSetEmitsDedicatedVerdict) {
     }
     auto preds = copy_targets(ds.y_val);
     const auto r = compare_to_baselines(ds, preds, true);
-    EXPECT_EQ(r.verdict, "Cannot evaluate — val set has only one class.");
+    EXPECT_EQ(r.verdict, "Cannot evaluate — the held-back rows all have the same class.");
 }
 
 // ---------------------------------------------------------------------------
@@ -266,7 +266,7 @@ TEST(Baselines, EmptyValSetEmitsCannotEvaluate) {
     ds.is_classification = true;
     auto preds = std::vector<std::vector<double>>{};
     const auto r = compare_to_baselines(ds, preds, true);
-    EXPECT_EQ(r.verdict, "Cannot evaluate — val set is empty.");
+    EXPECT_EQ(r.verdict, "Cannot evaluate — no rows were held back for checking.");
     EXPECT_TRUE(r.baselines.empty());
 }
 

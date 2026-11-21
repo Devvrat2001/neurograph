@@ -205,3 +205,56 @@ TEST_F(PredictBinaryTest, MissingBundleExitsWithModelLoadFail) {
                                + " --out -");
     EXPECT_NE(rc, 0);
 }
+
+// ---------------------------------------------------------------------------
+// 6. A column the model needs is missing → exit 4, unless --allow-missing
+// ---------------------------------------------------------------------------
+
+namespace {
+
+fs::path write_csv_with_header(const fs::path& dir, const std::string& name,
+                               const std::string& header, int n_cols, int n_rows) {
+    const auto path = dir / name;
+    std::ofstream f(path, std::ios::binary);
+    f << header << '\n';
+    for (int i = 0; i < n_rows; ++i) {
+        for (int c = 0; c < n_cols; ++c) f << (c ? "," : "") << (0.1 * (i + c) - 0.5);
+        f << '\n';
+    }
+    return path;
+}
+
+} // namespace
+
+TEST_F(PredictBinaryTest, MissingColumnStopsWithInputError) {
+    const auto bundle = build_bundle(tmp_);
+    // "f2" misspelt: filling it with the training average would quietly
+    // give confident nonsense.
+    const auto in  = write_csv_with_header(tmp_, "typo.csv", "f1,feature2,f3", 3, 4);
+    const auto out = tmp_ / "preds.csv";
+    const int rc = run_predict("--model " + q(bundle) + " --in " + q(in)
+                               + " --out " + q(out));
+    EXPECT_EQ(rc, 4);
+}
+
+TEST_F(PredictBinaryTest, AllowMissingFillsTheColumnAndCarriesOn) {
+    const auto bundle = build_bundle(tmp_);
+    const auto in  = write_csv_with_header(tmp_, "two_cols.csv", "f1,f3", 2, 4);
+    const auto out = tmp_ / "preds.csv";
+    const int rc = run_predict("--model " + q(bundle) + " --in " + q(in)
+                               + " --out " + q(out) + " --allow-missing");
+    ASSERT_EQ(rc, 0);
+    EXPECT_EQ(read_lines(out).size(), 5u);   // header + 4 rows
+}
+
+TEST_F(PredictBinaryTest, HeaderWithByteOrderMarkAndSpacesIsAccepted) {
+    // Excel's "CSV UTF-8" export starts the file with a byte-order mark.
+    const auto bundle = build_bundle(tmp_);
+    const auto in  = write_csv_with_header(tmp_, "excel.csv",
+                                           "\xEF\xBB\xBF" "f1, f2 ,f3", 3, 4);
+    const auto out = tmp_ / "preds.csv";
+    const int rc = run_predict("--model " + q(bundle) + " --in " + q(in)
+                               + " --out " + q(out));
+    ASSERT_EQ(rc, 0);
+    EXPECT_EQ(read_lines(out).size(), 5u);
+}
