@@ -8,6 +8,8 @@ desktop app, the command line, or your own programs.
 > tests and 12 performance tests pass on a fresh checkout; two more run
 > only when the MNIST files are placed in `datasets/mnist`.
 
+![The data check on a synthetic customer file: the ID column is left out, the signup date is read as a date, and blank cells are filled in](docs/images/data-check.png)
+
 ---
 
 ## What it does
@@ -33,6 +35,12 @@ desktop app, the command line, or your own programs.
    A model report (`card.md`) and a manifest with file hashes are written
    alongside.
 
+On the same customer file (synthetic, from `tools/bench`), the results
+say plainly that the model is only a little better than always guessing
+"not churned":
+
+![Results: accuracy on 719 held-back rows next to what always guessing would score, the three models compared, and the columns the model relies on most](docs/images/results.png)
+
 ## Accuracy
 
 Each dataset was split once into a training file and an untouched test
@@ -48,7 +56,7 @@ preprocessing. All were scored on the same test rows.
 | Wine (178) | 3 classes | 98.1% | 100% (several) | < 1 s |
 | Breast cancer (569) | 2 classes | 93.0% | 97.1% (boosted trees) | < 1 s |
 | Digits (1,797) | 10 classes | 96.5% | 98.2% (boosted trees) | 11 s |
-| Customer churn (6,000), IDs and dates left in | 2 classes | 83.5%, AUC 0.80 | 84.3%, AUC 0.80 (boosted trees) | < 1 s |
+| Customer churn, synthetic (6,000), IDs and dates left in | 2 classes | 83.5%, AUC 0.80 | 84.3%, AUC 0.80 (boosted trees) | < 1 s |
 | Synthetic (12,000 × 20) | 2 classes | 93.1% | 93.3% (MLP) | 4 s |
 | Synthetic (60,000 × 40) | 2 classes | 94.7% | 95.2% (MLP) | 43 s |
 | Diabetes (442) | a number | R² 0.394 | R² 0.400 (ridge) | < 1 s |
