@@ -5,6 +5,7 @@
 // with the reason and a way to try again.
 
 #include "wizard_ui.hpp"
+#include "theme.hpp"
 #include "neurograph/workbench/wizard_state.hpp"
 
 #include "imgui.h"
@@ -50,17 +51,19 @@ void render_options(WizardState& state) {
             state.time_budget = opt;
         }
     }
-    ImGui::TextDisabled("%s", budget_explanation(state.time_budget));
+    text_hint(budget_explanation(state.time_budget));
     ImGui::Spacing();
 
     ImGui::TextUnformatted("What should be predicted?");
-    const char* opts[] = {"Decide from the column (recommended)",
-                          "A category (classification)",
-                          "A number (regression)"};
-    int current = static_cast<int>(state.task_override);
-    ImGui::SetNextItemWidth(320);
-    if (ImGui::Combo("##task_override", &current, opts, 3)) {
-        set_task_override(state, static_cast<TaskOverride>(current));
+    const struct { TaskOverride task; const char* label; } tasks[] = {
+        {TaskOverride::Auto,           "Decide from the column (recommended)"},
+        {TaskOverride::Classification, "A category (classification)"},
+        {TaskOverride::Regression,     "A number (regression)"},
+    };
+    for (const auto& t : tasks) {
+        if (ImGui::RadioButton(t.label, state.task_override == t.task)) {
+            set_task_override(state, t.task);
+        }
     }
 
     if (!state.excluded_columns.empty()) {
@@ -81,48 +84,62 @@ void render_progress(const WizardState& state) {
     if (!snap.message.empty()) ImGui::TextDisabled("%s", snap.message.c_str());
 }
 
+// A large button with a quiet note beside it, centred on the button.
+bool big_button_with_note(const char* label, bool accent, const char* note) {
+    const ImVec2 size(ImGui::GetFontSize() * 12.0f, ImGui::GetFrameHeight() * 1.5f);
+    const bool clicked = accent ? accent_button(label, size) : ImGui::Button(label, size);
+    // Text on the same line as a button is already lowered by the frame
+    // padding; move it the rest of the way to the button's middle.
+    ImGui::SameLine();
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (size.y - ImGui::GetTextLineHeight()) * 0.5f -
+                         ImGui::GetStyle().FramePadding.y);
+    ImGui::TextDisabled("%s", note);
+    return clicked;
+}
+
 } // namespace
 
 void render_step_train(WizardState& state, WizardRuntime& rt) {
+    const ImVec2 button(ImGui::GetFontSize() * 10.0f, 0.0f);
     switch (state.status.load()) {
         case TrainingStatus::Idle: {
             render_options(state);
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::Spacing();
-            if (ImGui::Button("Train", ImVec2(220, 40))) start_training(state, rt);
-            ImGui::SameLine();
-            ImGui::TextDisabled("(you can stop at any time)");
+            if (big_button_with_note("Train", true, "You can stop it at any time.")) {
+                start_training(state, rt);
+            }
             break;
         }
         case TrainingStatus::Running: {
             render_progress(state);
             ImGui::Spacing();
-            if (ImGui::Button("Stop", ImVec2(160, 32))) request_cancel(state);
-            ImGui::SameLine();
-            ImGui::TextDisabled("Stops within a second or two.");
+            if (big_button_with_note("Stop", false, "Stops within a second or two.")) {
+                request_cancel(state);
+            }
             break;
         }
         case TrainingStatus::Succeeded: {
             // Normally the wizard moves to Results on its own; this shows
             // when the user came back with Back.
-            ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "The last run succeeded.");
-            if (ImGui::Button("View results", ImVec2(200, 0))) advance(state);
+            ImGui::TextColored(colors::good, "The last run succeeded.");
+            if (accent_button("View results", button)) advance(state);
             ImGui::SameLine();
-            if (ImGui::Button("Train again", ImVec2(200, 0))) reset_to_train(state);
+            if (ImGui::Button("Train again", button)) reset_to_train(state);
             break;
         }
         case TrainingStatus::Failed: {
-            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Training did not complete:");
+            ImGui::TextColored(colors::bad, "Training did not complete:");
             ImGui::TextWrapped("%s", state.error_message.c_str());
             ImGui::Spacing();
-            if (ImGui::Button("Try again", ImVec2(200, 0))) reset_to_train(state);
+            if (ImGui::Button("Try again", button)) reset_to_train(state);
             break;
         }
         case TrainingStatus::Cancelled: {
-            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Training was stopped.");
+            ImGui::TextColored(colors::caution, "Training was stopped.");
             ImGui::Spacing();
-            if (ImGui::Button("Train again", ImVec2(200, 0))) reset_to_train(state);
+            if (ImGui::Button("Train again", button)) reset_to_train(state);
             break;
         }
     }

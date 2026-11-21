@@ -26,14 +26,12 @@ void clear_plan(WizardState& s) {
 std::string can_advance(const WizardState& s) {
     switch (s.current_step) {
         case WizardStep::Load:
+            // The UI shows these next to the greyed-out Next button.
             if (!s.csv) {
-                // User hasn't dropped a file yet. The UI greys the
-                // button; this message isn't normally displayed, but
-                // keeps the contract honest for headless callers.
-                return "Load a CSV file to continue.";
+                return "Choose a CSV file to continue.";
             }
             if (s.target_column.empty()) {
-                return "Pick a target column to continue.";
+                return "Choose the column to predict.";
             }
             // Defense-in-depth: default_target_column should have
             // already picked a column, but if someone cleared it
@@ -41,16 +39,16 @@ std::string can_advance(const WizardState& s) {
             {
                 const auto& cols = s.csv->columns;
                 if (std::find(cols.begin(), cols.end(), s.target_column) == cols.end()) {
-                    return "Selected target column is not in this file.";
+                    return "The column to predict is not in this file.";
                 }
             }
             return "";
         case WizardStep::Quality:
             if (!s.dq_report) {
-                return "Data quality report missing.";
+                return "The data check has not run yet.";
             }
             if (has_blocking_error(s)) {
-                return "Fix the blocking data quality error to continue.";
+                return "Fix the blocking problem to continue.";
             }
             return "";
         case WizardStep::Train:
@@ -59,11 +57,11 @@ std::string can_advance(const WizardState& s) {
             // success — this guard catches "user hit Next after a
             // failure" etc.
             if (s.status.load() != TrainingStatus::Succeeded) {
-                return "Training must finish successfully before viewing results.";
+                return "Train a model to see its results.";
             }
             return "";
         case WizardStep::Results:
-            return "Already on the last step.";
+            return "This is the last step.";
     }
     return "";   // unreachable; GCC wants the terminator
 }

@@ -10,6 +10,7 @@
 // in WizardState until the file, target or task changes.
 
 #include "wizard_ui.hpp"
+#include "theme.hpp"
 #include "neurograph/dataqc/scanner.hpp"
 #include "neurograph/preprocess/pipeline.hpp"
 #include "neurograph/workbench/wizard_state.hpp"
@@ -26,8 +27,8 @@ namespace {
 ImVec4 color_for_severity(dataqc::Severity s) {
     switch (s) {
         case dataqc::Severity::Info:    return ImVec4(0.6f, 0.8f, 1.0f, 1.0f);
-        case dataqc::Severity::Warning: return ImVec4(1.0f, 0.8f, 0.3f, 1.0f);
-        case dataqc::Severity::Error:   return ImVec4(1.0f, 0.35f, 0.35f, 1.0f);
+        case dataqc::Severity::Warning: return colors::caution;
+        case dataqc::Severity::Error:   return colors::bad;
     }
     return ImVec4(1, 1, 1, 1);
 }
@@ -82,7 +83,7 @@ void render_findings(const dataqc::DataQualityReport& dq) {
         ImGui::TextWrapped("%s", f.message.c_str());
         if (!f.remedy.empty()) {
             ImGui::Indent();
-            ImGui::TextDisabled("%s", f.remedy.c_str());
+            text_hint(f.remedy);
             ImGui::Unindent();
         }
     }
@@ -101,11 +102,16 @@ void render_columns(WizardState& state) {
                        "missed.");
     const ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                                   ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp;
-    const float height = ImGui::GetTextLineHeightWithSpacing() *
-                         static_cast<float>(std::min<std::size_t>(state.column_plan.size() + 1, 14));
+    // Rows hold a tick box, so they are a frame tall, not a text line.
+    // Up to 15 rows show at once; longer lists scroll under the header.
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float header_h = ImGui::GetTextLineHeight() + style.CellPadding.y * 2.0f;
+    const float row_h    = ImGui::GetFrameHeight() + style.CellPadding.y * 2.0f;
+    const std::size_t visible = std::min<std::size_t>(state.column_plan.size(), 15);
+    const float height = header_h + row_h * static_cast<float>(visible) + 2.0f;
     if (!ImGui::BeginTable("columns", 4, flags, ImVec2(0.0f, height))) return;
     ImGui::TableSetupScrollFreeze(0, 1);
-    ImGui::TableSetupColumn("Use", ImGuiTableColumnFlags_WidthFixed, 36.0f);
+    ImGui::TableSetupColumn("Use", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFrameHeight() + 8.0f);
     ImGui::TableSetupColumn("Column");
     ImGui::TableSetupColumn("Used as");
     ImGui::TableSetupColumn("Why", ImGuiTableColumnFlags_WidthStretch, 3.0f);
@@ -120,6 +126,7 @@ void render_columns(WizardState& state) {
 
         ImGui::TableSetColumnIndex(0);
         if (is_target) {
+            ImGui::AlignTextToFramePadding();
             ImGui::TextDisabled("-");
         } else {
             bool use = !auto_out && !user_out;
@@ -127,13 +134,17 @@ void render_columns(WizardState& state) {
             if (ImGui::Checkbox("##use", &use)) toggle_excluded_column(state, c.name);
             ImGui::EndDisabled();
         }
+        // Text cells are lined up with the tick box's label height.
         ImGui::TableSetColumnIndex(1);
+        ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted(c.name.c_str());
         ImGui::TableSetColumnIndex(2);
+        ImGui::AlignTextToFramePadding();
         if (is_target)      ImGui::TextColored(ImVec4(0.3f, 0.75f, 1.0f, 1.0f), "to predict");
         else if (user_out)  ImGui::TextDisabled("left out");
         else                ImGui::TextUnformatted(c.role.c_str());
         ImGui::TableSetColumnIndex(3);
+        ImGui::AlignTextToFramePadding();
         if (user_out)            ImGui::TextDisabled("left out by you");
         else if (!c.note.empty()) ImGui::TextWrapped("%s", c.note.c_str());
         ImGui::PopID();
@@ -159,9 +170,10 @@ void render_step_quality(WizardState& state, WizardRuntime& /*rt*/) {
     }
     if (has_blocking_error(state)) {
         ImGui::Spacing();
-        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f),
-                           "Training cannot start until the blocking problem is fixed in "
+        ImGui::PushStyleColor(ImGuiCol_Text, colors::bad);
+        ImGui::TextWrapped("Training cannot start until the blocking problem is fixed in "
                            "the file (or a different column is chosen to predict).");
+        ImGui::PopStyleColor();
     }
     ImGui::Spacing();
     if (ImGui::CollapsingHeader("Columns", ImGuiTreeNodeFlags_DefaultOpen)) {

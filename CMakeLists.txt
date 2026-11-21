@@ -397,37 +397,48 @@ neurograph_copy_runtime_dlls(neurograph_keygen)
 # --- Workbench (ImGui + DirectX 11) ---
 find_package(imgui CONFIG REQUIRED)
 
-add_executable(neurograph_workbench WIN32
-    src/workbench/workbench_app.cpp
-    # P1-09 wizard UI. State + csv_preview translation units already
-    # live in neurograph_lib so the unit tests can link them without
-    # pulling ImGui in; only the render layer is workbench-only.
+# The ImGui-bound wizard screens and the theme. The wizard state and
+# csv_preview live in neurograph_lib so the unit tests can link them
+# without ImGui; this library is shared by the workbench, the render
+# perf test and the snapshot tool.
+add_library(neurograph_workbench_ui STATIC
+    src/workbench/theme.cpp
     src/workbench/wizard/wizard_ui.cpp
     src/workbench/wizard/step_load.cpp
     src/workbench/wizard/step_quality.cpp
     src/workbench/wizard/step_train.cpp
     src/workbench/wizard/step_results.cpp
     src/workbench/wizard/native_dialogs.cpp
+)
+target_link_libraries(neurograph_workbench_ui PUBLIC
+    neurograph_lib
+    imgui::imgui
+    # File dialogs (COM) and shell helpers.
+    ole32
+    shell32
+    uuid
+)
+# The step .cpp files and their users include "wizard_ui.hpp" and
+# "theme.hpp" with no relative qualifier.
+target_include_directories(neurograph_workbench_ui PUBLIC
+    ${CMAKE_SOURCE_DIR}/src/workbench
+    ${CMAKE_SOURCE_DIR}/src/workbench/wizard
+)
+
+add_executable(neurograph_workbench WIN32
+    src/workbench/workbench_app.cpp
     # P1-11 license dialog -- ImGui-bound, so workbench-only. The
     # crypto/persistence/trial logic lives in neurograph_lib.
     src/workbench/license_dialog.cpp
     ${NEUROGRAPH_CUDA_LINK_STUB}
 )
 target_link_libraries(neurograph_workbench PRIVATE
-    neurograph_lib
-    imgui::imgui
+    neurograph_workbench_ui
     d3d11
     dxgi
-    # File dialogs (COM) and drag-and-drop.
-    ole32
-    shell32
-    uuid
 )
 target_include_directories(neurograph_workbench PRIVATE
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
-    # The wizard step .cpp files include "wizard_ui.hpp" with no
-    # relative qualifier; add the wizard directory so that resolves.
-    ${CMAKE_SOURCE_DIR}/src/workbench/wizard
 )
 set_target_properties(neurograph_workbench PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
@@ -435,6 +446,25 @@ set_target_properties(neurograph_workbench PROPERTIES
 )
 neurograph_attach_asan_runtime(neurograph_workbench)
 neurograph_copy_runtime_dlls(neurograph_workbench)
+
+# Pictures of each wizard step, drawn off-screen with the workbench's
+# own step renderers, fonts and colours (Direct3D 11, no window). For
+# checking the screens without starting the app.
+add_executable(neurograph_wizard_snapshots
+    tools/wizard_snapshots/wizard_snapshots.cpp
+    ${NEUROGRAPH_CUDA_LINK_STUB}
+)
+target_link_libraries(neurograph_wizard_snapshots PRIVATE
+    neurograph_workbench_ui
+    d3d11
+    windowscodecs
+)
+set_target_properties(neurograph_wizard_snapshots PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+neurograph_attach_asan_runtime(neurograph_wizard_snapshots)
+neurograph_copy_runtime_dlls(neurograph_wizard_snapshots)
 
 # --- Tests ---
 if(NEUROGRAPH_BUILD_TESTS)

@@ -177,9 +177,9 @@ struct WizardState {
 // ---------------------------------------------------------------------------
 
 /// Is it legal for the user to click "Next" right now? Returns an
-/// empty string when yes, otherwise a reason string to surface next to
-/// the disabled button ("Pick a target column", "Fix the blocking
-/// data quality error", etc.). Never returns nullptr.
+/// empty string when yes, otherwise the reason, which the wizard shows
+/// next to the disabled button ("Choose a CSV file to continue.", "Fix
+/// the blocking problem to continue.", etc.).
 std::string can_advance(const WizardState& s);
 
 /// Move to the next step if `can_advance` would allow. Returns true

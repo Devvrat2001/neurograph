@@ -7,6 +7,7 @@
 
 #include "wizard_ui.hpp"
 #include "native_dialogs.hpp"
+#include "theme.hpp"
 #include "neurograph/workbench/csv_preview.hpp"
 #include "neurograph/workbench/wizard_state.hpp"
 
@@ -25,6 +26,20 @@ char g_path_buf[2048] = "";
 
 // Tables wider than this become unreadable; the rest are summarised.
 constexpr std::size_t kMaxPreviewColumns = 40;
+
+// Width of the preview table with each column as wide as its widest cell.
+float preview_width(const CsvMetadata& csv, std::size_t shown) {
+    const float pad = ImGui::GetStyle().CellPadding.x * 2.0f + 1.0f;   // + border
+    float total = 0.0f;
+    for (std::size_t i = 0; i < shown; ++i) {
+        float w = ImGui::CalcTextSize(csv.columns[i].c_str()).x;
+        for (const auto& row : csv.preview_rows) {
+            if (i < row.size()) w = std::max(w, ImGui::CalcTextSize(row[i].c_str()).x);
+        }
+        total += w + pad;
+    }
+    return total;
+}
 
 void load_path(WizardState& state, const std::filesystem::path& p) {
     std::snprintf(g_path_buf, sizeof(g_path_buf), "%s", path_utf8(p).c_str());
@@ -52,38 +67,52 @@ void render_step_load(WizardState& state, WizardRuntime& rt) {
         load_path(state, dropped);
     }
 
-    if (ImGui::Button("Browse...", ImVec2(120, 0))) {
+    // Browse is the main action until a file is loaded; then Next is.
+    const float button_w = ImGui::GetFontSize() * 7.0f;
+    const bool browse = state.csv ? ImGui::Button("Browse...", ImVec2(button_w, 0))
+                                  : accent_button("Browse...", ImVec2(button_w, 0));
+    if (browse) {
         if (auto p = pick_csv_file()) load_path(state, *p);
     }
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(-130.0f);
+    ImGui::SetNextItemWidth(-(button_w + ImGui::GetStyle().ItemSpacing.x));
     const bool entered = ImGui::InputTextWithHint(
         "##csv_path", "or paste a path here, or drag a file onto this window",
         g_path_buf, sizeof(g_path_buf), ImGuiInputTextFlags_EnterReturnsTrue);
     ImGui::SameLine();
-    const bool load_clicked = ImGui::Button("Load", ImVec2(120, 0));
+    const bool load_clicked = ImGui::Button("Load", ImVec2(button_w, 0));
     if ((load_clicked || entered) && g_path_buf[0] != '\0') {
         load_path(state, path_from_utf8(g_path_buf));
     }
 
     if (!state.load_error.empty()) {
-        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "Could not load the file: %s",
-                           state.load_error.c_str());
+        ImGui::TextColored(colors::bad, "Could not load the file: %s", state.load_error.c_str());
     }
     if (!state.csv) return;
 
     const auto& csv = *state.csv;
+    ImGui::Spacing();
     ImGui::Separator();
-    ImGui::Text("File: %s", path_utf8(csv.path.filename()).c_str());
-    ImGui::Text("%zu rows, %zu columns", csv.row_count, csv.columns.size());
+    ImGui::Spacing();
+    ImGui::Text("%s: %s rows, %zu columns", path_utf8(csv.path.filename()).c_str(),
+                with_commas(csv.row_count).c_str(), csv.columns.size());
     ImGui::Spacing();
 
+    // Columns wider than the window scroll sideways; the table is then
+    // given room for the header, the preview rows and the scroll bar.
+    // Otherwise it takes the height of its rows.
+    const ImGuiStyle& style = ImGui::GetStyle();
     const std::size_t shown = std::min(csv.columns.size(), kMaxPreviewColumns);
+    const bool wide = preview_width(csv, shown) > ImGui::GetContentRegionAvail().x * 0.98f;
+    const float row_h   = ImGui::GetTextLineHeight() + style.CellPadding.y * 2.0f;
+    const float table_h = wide ? row_h * static_cast<float>(csv.preview_rows.size() + 1) +
+                                 style.ScrollbarSize + 2.0f
+                               : 0.0f;
+    ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                            ImGuiTableFlags_SizingFixedFit;
+    if (wide) flags |= ImGuiTableFlags_ScrollX;
     if (!csv.preview_rows.empty() && shown > 0
-        && ImGui::BeginTable("preview", static_cast<int>(shown),
-                             ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                             ImGuiTableFlags_ScrollX | ImGuiTableFlags_SizingFixedFit,
-                             ImVec2(0.0f, ImGui::GetTextLineHeightWithSpacing() * 7.5f))) {
+        && ImGui::BeginTable("preview", static_cast<int>(shown), flags, ImVec2(0.0f, table_h))) {
         for (std::size_t i = 0; i < shown; ++i) {
             ImGui::TableSetupColumn(csv.columns[i].c_str());
         }
@@ -102,9 +131,10 @@ void render_step_load(WizardState& state, WizardRuntime& rt) {
     }
 
     ImGui::Spacing();
+    ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted("Column to predict:");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(260);
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16.0f);
     if (ImGui::BeginCombo("##target", state.target_column.c_str())) {
         for (const auto& col : csv.columns) {
             const bool selected = (col == state.target_column);

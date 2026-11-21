@@ -107,6 +107,12 @@ packages are already installed under `build/vcpkg_installed`, the small
 `vcpkg-toolchain.cmake` in this folder can be used instead of a full vcpkg
 checkout.
 
+To see the desktop app's screens without running it,
+`neurograph_wizard_snapshots --csv data.csv --out shots` draws every
+wizard step for that file, training included, to PNG files. It uses the
+app's own drawing code, fonts and colours. `--size` and `--dpi` show
+other window sizes and display scaling.
+
 | CMake option | Default | Purpose |
 |---|---|---|
 | `NEUROGRAPH_BUILD_TESTS` | ON | Unit, integration and performance tests. |

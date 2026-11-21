@@ -102,36 +102,16 @@ add_executable(neurograph_perf
     perf/test_perf_predict_binary.cpp
     perf/test_perf_auto_pipeline.cpp
     perf/test_perf_binary_size.cpp
-    # P1-09 AC2: headless ImGui frame-time bench. Compiled with the
-    # wizard render TUs since they're not in neurograph_lib (the lib
-    # avoids the ImGui dependency for unit-test isolation; render
-    # files only ship inside neurograph_workbench.exe + this perf
-    # target).
+    # P1-09 AC2: headless ImGui frame-time bench over the wizard
+    # screens in neurograph_workbench_ui.
     perf/test_perf_wizard_render.cpp
-    ${CMAKE_SOURCE_DIR}/src/workbench/wizard/wizard_ui.cpp
-    ${CMAKE_SOURCE_DIR}/src/workbench/wizard/step_load.cpp
-    ${CMAKE_SOURCE_DIR}/src/workbench/wizard/step_quality.cpp
-    ${CMAKE_SOURCE_DIR}/src/workbench/wizard/step_train.cpp
-    ${CMAKE_SOURCE_DIR}/src/workbench/wizard/step_results.cpp
-    ${CMAKE_SOURCE_DIR}/src/workbench/wizard/native_dialogs.cpp
     ${NEUROGRAPH_CUDA_LINK_STUB}
 )
 
 target_link_libraries(neurograph_perf PRIVATE
     neurograph_lib
+    neurograph_workbench_ui
     GTest::gtest_main
-    imgui::imgui   # P1-09 AC2: wizard render perf test needs ImGui
-)
-if(WIN32)
-    # The wizard's file dialogs (COM) and shell helpers.
-    target_link_libraries(neurograph_perf PRIVATE ole32 shell32 uuid)
-endif()
-
-# Wizard render headers live in src/workbench/wizard/. The perf test
-# includes "wizard_ui.hpp" with no relative qualifier (matches what
-# the workbench exe's CMake does).
-target_include_directories(neurograph_perf PRIVATE
-    ${CMAKE_SOURCE_DIR}/src/workbench/wizard
 )
 
 add_dependencies(neurograph_perf neurograph_predict)

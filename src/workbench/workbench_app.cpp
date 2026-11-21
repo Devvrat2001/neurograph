@@ -24,6 +24,7 @@
 // crypto/persistence/trial logic stays in neurograph_lib so the unit
 // tests can exercise it without spinning up D3D11.
 #include "license_dialog.hpp"
+#include "theme.hpp"
 #include "neurograph/licensing/license.hpp"
 
 #include "imgui.h"
@@ -1623,7 +1624,8 @@ static void draw_create_dialog() {
     ImGui::OpenPopup("Create New Network");
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(Scaled(480, 420));
+    // Height 0: fit the contents, so the buttons are never cut off.
+    ImGui::SetNextWindowSize(ImVec2(Scaled(480), 0.0f));
 
     if (ImGui::BeginPopupModal("Create New Network", &g_app.show_create_dialog)) {
         ImGui::Spacing();
@@ -1632,7 +1634,9 @@ static void draw_create_dialog() {
         ImGui::Separator();
         ImGui::Spacing();
 
-        ImGui::SetNextItemWidth(-1);
+        // Wide fields leave room for their labels on the right.
+        const float field_w = Scaled(300);
+        ImGui::SetNextItemWidth(field_w);
         ImGui::InputText("Name", g_app.new_name, sizeof(g_app.new_name));
         ImGui::Spacing();
 
@@ -1642,14 +1646,14 @@ static void draw_create_dialog() {
         ImGui::InputInt("Connections", &g_app.new_connections);
         ImGui::Spacing();
 
-        ImGui::SetNextItemWidth(-1);
+        ImGui::SetNextItemWidth(field_w);
         ImGui::Combo("Task Type", &g_app.new_task_type, task_type_names, 6);
         ImGui::SetNextItemWidth(Scaled(180));
         ImGui::InputFloat("Learning Rate", &g_app.new_lr, 0.001f, 0.01f, "%.4f");
         ImGui::Spacing();
 
         ImGui::InputTextMultiline("Description", g_app.new_desc, sizeof(g_app.new_desc),
-                                  ImVec2(-1, Scaled(70)));
+                                  ImVec2(field_w, Scaled(70)));
 
         g_app.new_neurons = std::clamp(g_app.new_neurons, 2, 50000);
         g_app.new_connections = std::clamp(g_app.new_connections, 0, 200000);
@@ -1686,7 +1690,7 @@ static void draw_delete_dialog() {
     ImGui::OpenPopup("Confirm Deletion");
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(Scaled(380, 160));
+    ImGui::SetNextWindowSize(ImVec2(Scaled(380), 0.0f));   // height fits the contents
 
     if (ImGui::BeginPopupModal("Confirm Deletion", &g_app.show_delete_dialog)) {
         ImGui::Spacing();
@@ -2086,118 +2090,6 @@ static void draw_frame() {
 }
 
 // =================================================================
-// Style Setup
-// =================================================================
-static void setup_style() {
-    ImGui::StyleColorsDark();
-    ImGuiStyle& s = ImGui::GetStyle();
-
-    // Geometry - scaled by DPI
-    s.WindowRounding    = Scaled(6);
-    s.FrameRounding     = Scaled(4);
-    s.GrabRounding      = Scaled(4);
-    s.TabRounding       = Scaled(4);
-    s.ScrollbarRounding = Scaled(6);
-    s.ChildRounding     = Scaled(4);
-    s.PopupRounding     = Scaled(4);
-
-    s.WindowPadding     = Scaled(12, 12);
-    s.FramePadding      = Scaled(10, 6);
-    s.ItemSpacing       = Scaled(10, 8);
-    s.ItemInnerSpacing  = Scaled(8, 6);
-    s.IndentSpacing     = Scaled(20);
-    s.ScrollbarSize     = Scaled(14);
-    s.GrabMinSize       = Scaled(12);
-    s.WindowBorderSize  = 1.0f;
-    s.FrameBorderSize   = 0.0f;
-    s.TabBorderSize     = 0.0f;
-    s.SeparatorTextBorderSize = Scaled(2);
-
-    // Color palette - high contrast dark theme with blue accents
-    ImVec4* c = s.Colors;
-
-    // Backgrounds
-    c[ImGuiCol_WindowBg]             = ImVec4(0.06f, 0.07f, 0.11f, 1.00f);
-    c[ImGuiCol_ChildBg]              = ImVec4(0.06f, 0.07f, 0.11f, 0.00f);
-    c[ImGuiCol_PopupBg]              = ImVec4(0.08f, 0.09f, 0.14f, 0.97f);
-
-    // Borders
-    c[ImGuiCol_Border]               = ImVec4(0.18f, 0.20f, 0.28f, 0.80f);
-    c[ImGuiCol_BorderShadow]         = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-
-    // Frame (input fields, etc)
-    c[ImGuiCol_FrameBg]              = ImVec4(0.10f, 0.12f, 0.18f, 1.00f);
-    c[ImGuiCol_FrameBgHovered]       = ImVec4(0.14f, 0.16f, 0.24f, 1.00f);
-    c[ImGuiCol_FrameBgActive]        = ImVec4(0.16f, 0.20f, 0.30f, 1.00f);
-
-    // Title bars
-    c[ImGuiCol_TitleBg]              = ImVec4(0.05f, 0.06f, 0.09f, 1.00f);
-    c[ImGuiCol_TitleBgActive]        = ImVec4(0.08f, 0.10f, 0.16f, 1.00f);
-    c[ImGuiCol_TitleBgCollapsed]     = ImVec4(0.04f, 0.05f, 0.08f, 0.80f);
-
-    // Menu bar
-    c[ImGuiCol_MenuBarBg]            = ImVec4(0.07f, 0.08f, 0.12f, 1.00f);
-
-    // Scrollbar
-    c[ImGuiCol_ScrollbarBg]          = ImVec4(0.05f, 0.06f, 0.09f, 0.60f);
-    c[ImGuiCol_ScrollbarGrab]        = ImVec4(0.20f, 0.24f, 0.35f, 1.00f);
-    c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.28f, 0.32f, 0.45f, 1.00f);
-    c[ImGuiCol_ScrollbarGrabActive]  = ImVec4(0.34f, 0.40f, 0.55f, 1.00f);
-
-    // Buttons
-    c[ImGuiCol_Button]               = ImVec4(0.14f, 0.18f, 0.28f, 1.00f);
-    c[ImGuiCol_ButtonHovered]        = ImVec4(0.20f, 0.26f, 0.40f, 1.00f);
-    c[ImGuiCol_ButtonActive]         = ImVec4(0.16f, 0.44f, 0.82f, 1.00f);
-
-    // Headers (collapsing headers, tree nodes, selectable)
-    c[ImGuiCol_Header]               = ImVec4(0.12f, 0.16f, 0.26f, 1.00f);
-    c[ImGuiCol_HeaderHovered]        = ImVec4(0.18f, 0.24f, 0.38f, 1.00f);
-    c[ImGuiCol_HeaderActive]         = ImVec4(0.16f, 0.44f, 0.82f, 1.00f);
-
-    // Separator
-    c[ImGuiCol_Separator]            = ImVec4(0.18f, 0.20f, 0.28f, 1.00f);
-    c[ImGuiCol_SeparatorHovered]     = ImVec4(0.30f, 0.50f, 0.80f, 0.80f);
-    c[ImGuiCol_SeparatorActive]      = ImVec4(0.30f, 0.50f, 0.80f, 1.00f);
-
-    // Resize grip
-    c[ImGuiCol_ResizeGrip]           = ImVec4(0.20f, 0.30f, 0.50f, 0.40f);
-    c[ImGuiCol_ResizeGripHovered]    = ImVec4(0.30f, 0.50f, 0.80f, 0.60f);
-    c[ImGuiCol_ResizeGripActive]     = ImVec4(0.30f, 0.50f, 0.80f, 0.90f);
-
-    // Tabs
-    c[ImGuiCol_Tab]                  = ImVec4(0.08f, 0.10f, 0.16f, 1.00f);
-    c[ImGuiCol_TabHovered]           = ImVec4(0.16f, 0.44f, 0.82f, 0.80f);
-    c[ImGuiCol_TabSelected]          = ImVec4(0.14f, 0.36f, 0.68f, 1.00f);
-    c[ImGuiCol_TabDimmed]            = ImVec4(0.06f, 0.08f, 0.12f, 1.00f);
-    c[ImGuiCol_TabDimmedSelected]    = ImVec4(0.10f, 0.22f, 0.42f, 1.00f);
-
-    // Docking
-    c[ImGuiCol_DockingPreview]       = ImVec4(0.16f, 0.44f, 0.82f, 0.70f);
-    c[ImGuiCol_DockingEmptyBg]       = ImVec4(0.04f, 0.05f, 0.08f, 1.00f);
-
-    // Slider
-    c[ImGuiCol_SliderGrab]           = ImVec4(0.25f, 0.55f, 0.95f, 1.00f);
-    c[ImGuiCol_SliderGrabActive]     = ImVec4(0.35f, 0.65f, 1.00f, 1.00f);
-
-    // Check mark
-    c[ImGuiCol_CheckMark]            = ImVec4(0.30f, 0.65f, 1.00f, 1.00f);
-
-    // Plot
-    c[ImGuiCol_PlotLines]            = ImVec4(0.40f, 0.70f, 1.00f, 1.00f);
-    c[ImGuiCol_PlotLinesHovered]     = ImVec4(0.50f, 0.80f, 1.00f, 1.00f);
-    c[ImGuiCol_PlotHistogram]        = ImVec4(0.25f, 0.55f, 0.95f, 1.00f);
-    c[ImGuiCol_PlotHistogramHovered] = ImVec4(0.35f, 0.65f, 1.00f, 1.00f);
-
-    // Text
-    c[ImGuiCol_Text]                 = ImVec4(0.85f, 0.88f, 0.95f, 1.00f);
-    c[ImGuiCol_TextDisabled]         = ImVec4(0.40f, 0.42f, 0.50f, 1.00f);
-    c[ImGuiCol_TextSelectedBg]       = ImVec4(0.16f, 0.44f, 0.82f, 0.40f);
-
-    // Nav
-    c[ImGuiCol_NavHighlight]         = ImVec4(0.30f, 0.60f, 1.00f, 1.00f);
-}
-
-// =================================================================
 // DirectX 11 Helpers
 // =================================================================
 static bool CreateDeviceD3D(HWND hWnd) {
@@ -2297,9 +2189,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
     g_dpiScale = dpiX / 96.0f;
 
-    // Scale window size by DPI
-    int winW = static_cast<int>(1600 * g_dpiScale);
-    int winH = static_cast<int>(900 * g_dpiScale);
+    // 1600x900 at 100% scaling, but never larger than the screen's work
+    // area (a 1366x768 laptop, or 150% scaling on a 1920x1080 one, would
+    // otherwise put the wizard's buttons below the screen edge). Centred.
+    RECT work{0, 0, 1600, 900};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    const int workW = work.right - work.left;
+    const int workH = work.bottom - work.top;
+    const int winW  = std::min(static_cast<int>(1600 * g_dpiScale), workW * 95 / 100);
+    const int winH  = std::min(static_cast<int>(900 * g_dpiScale), workH * 95 / 100);
+    const int winX  = work.left + (workW - winW) / 2;
+    const int winY  = work.top + (workH - winH) / 2;
 
     // Create application window
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L,
@@ -2307,7 +2207,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         L"NeuroGraphWorkbench", nullptr };
     RegisterClassExW(&wc);
     HWND hwnd = CreateWindowW(wc.lpszClassName, L"NeuroGraph Workbench",
-        WS_OVERLAPPEDWINDOW, 100, 50, winW, winH, nullptr, nullptr, wc.hInstance, nullptr);
+        WS_OVERLAPPEDWINDOW, winX, winY, winW, winH, nullptr, nullptr, wc.hInstance, nullptr);
     DragAcceptFiles(hwnd, TRUE);   // CSV files can be dropped onto the window
 
     if (!CreateDeviceD3D(hwnd)) {
@@ -2326,18 +2226,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.IniFilename = nullptr; // Disable ini persistence — we set layout programmatically
 
-    // Font: scale to DPI. Use built-in ProggyClean at large size, or the default at scaled size
-    float fontSize = 16.0f * g_dpiScale;
-    ImFontConfig fontConfig;
-    fontConfig.OversampleH = 2;
-    fontConfig.OversampleV = 2;
-    fontConfig.PixelSnapH = true;
-    io.Fonts->AddFontDefault(&fontConfig);
-    // Scale the default font
-    io.FontGlobalScale = fontSize / 13.0f;
-
-    // Apply our custom theme
-    setup_style();
+    workbench::load_fonts(g_dpiScale);
+    workbench::apply_style(g_dpiScale);
 
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
