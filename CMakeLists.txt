@@ -11,6 +11,7 @@ add_compile_definitions(NEUROGRAPH_VERSION_STRING="${PROJECT_VERSION}")
 
 # --- Options ---
 option(NEUROGRAPH_BUILD_TESTS "Build unit and integration tests" ON)
+option(NEUROGRAPH_BUILD_PERF  "Build the performance tests (with NEUROGRAPH_BUILD_TESTS)" ON)
 
 # The product (wizard, trainer, predict, runtime DLL) runs on the CPU and
 # needs no GPU toolkit. The CUDA kernels belong to the experimental

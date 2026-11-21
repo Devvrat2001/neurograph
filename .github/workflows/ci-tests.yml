@@ -1,9 +1,10 @@
 # Build and test on Windows (Release + Debug).
 #
-#   - Release: unit + integration tests, then the perf tests (non-blocking:
-#     shared runners are too noisy to gate on timing).
-#   - Debug:   unit + integration tests, plus an OpenCppCoverage report
-#     uploaded as an artifact.
+#   - Release: unit + integration tests, then the perf tests with their
+#     timing gates off (NEUROGRAPH_PERF_SKIP_GATE: shared runners are too
+#     noisy to gate on timing); any other perf failure fails the job.
+#   - Debug:   unit + integration tests (the perf tests are not built),
+#     plus an OpenCppCoverage report uploaded as an artifact.
 #
 # The product is Windows-only for now (Win32 + Direct3D 11 desktop app,
 # DPAPI-protected trial store), so there is no Linux job. The model
@@ -93,12 +94,16 @@ jobs:
       - name: Configure
         shell: pwsh
         run: |
-          $covFlag = if ("${{ matrix.config }}" -eq "Debug") { "ON" } else { "OFF" }
+          $covFlag  = if ("${{ matrix.config }}" -eq "Debug") { "ON" } else { "OFF" }
+          # Debug leaves the perf target out entirely: defining it without
+          # building it would make CTest register a failing placeholder.
+          $perfFlag = if ("${{ matrix.config }}" -eq "Release") { "ON" } else { "OFF" }
           cmake -S . -B build `
             -G "Visual Studio 17 2022" -A x64 `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=x64-windows `
             -DNEUROGRAPH_BUILD_TESTS=ON `
+            -DNEUROGRAPH_BUILD_PERF=$perfFlag `
             -DNEUROGRAPH_ENABLE_COVERAGE=$covFlag
           if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
 
@@ -123,18 +128,18 @@ jobs:
         run: |
           ctest --test-dir build -C ${{ matrix.config }} `
                 --output-on-failure --label-exclude perf `
-                --parallel 4
+                --no-tests=error --parallel 4
           if ($LASTEXITCODE -ne 0) { throw "ctest failed" }
 
-      - name: Run perf tests (Release only, non-blocking)
+      - name: Run perf tests (Release only, timings recorded, not gated)
         if: matrix.config == 'Release'
         shell: pwsh
         env:
           NEUROGRAPH_PERF_SKIP_GATE: "1"
         run: |
           ctest --test-dir build -C Release `
-                --output-on-failure --label perf
-          exit 0
+                --output-on-failure --label-regex perf --no-tests=error
+          if ($LASTEXITCODE -ne 0) { throw "perf tests failed" }
 
       - name: Run coverage (Debug only)
         if: matrix.config == 'Debug'

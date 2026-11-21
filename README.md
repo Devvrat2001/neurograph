@@ -124,6 +124,7 @@ other window sizes and display scaling.
 | CMake option | Default | Purpose |
 |---|---|---|
 | `NEUROGRAPH_BUILD_TESTS` | ON | Unit, integration and performance tests. |
+| `NEUROGRAPH_BUILD_PERF` | ON | The performance tests (`neurograph_perf`); OFF leaves them out. |
 | `NEUROGRAPH_ENABLE_CUDA` | OFF | Experimental GPU kernels and the legacy demo program; needs the CUDA toolkit. |
 | `NEUROGRAPH_ENABLE_COVERAGE` | OFF | `neurograph_coverage` target (OpenCppCoverage). |
 | `NEUROGRAPH_ENABLE_ASAN` | OFF | MSVC AddressSanitizer build. |
