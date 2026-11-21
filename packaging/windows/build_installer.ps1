@@ -26,9 +26,9 @@
   1.0.0. CI overrides this with a real release tag.
 
 .PARAMETER Manufacturer
-  Display name shown in Programs and Features and as the
-  SmartScreen "Publisher" once the MSI is signed. Defaults to
-  "NeuroGraph Inc." for local builds.
+  Display name shown in Programs and Features. Defaults to
+  "NeuroGraph". (The SmartScreen "Publisher" of a signed MSI comes
+  from the signing certificate, not from this.)
 
 .NOTES
   Requires:
@@ -41,7 +41,7 @@ param(
   [string]$BuildDir      = (Resolve-Path "$PSScriptRoot\..\..\build" -ErrorAction SilentlyContinue),
   [string]$Configuration = "Release",
   [string]$Version       = "1.0.0",
-  [string]$Manufacturer  = "NeuroGraph Inc."
+  [string]$Manufacturer  = "NeuroGraph"
 )
 
 $ErrorActionPreference = "Stop"

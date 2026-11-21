@@ -835,7 +835,7 @@ Commercial software ships as an installer, not a zip. MSI is the only format IT 
 - [x] `msiexec /i NeuroGraph.msi /quiet` installs silently, returns exit 0. *(verified locally via `msiexec /a` admin extract; full elevated `/i` path covered by `release-windows.yml` smoke step.)*
 - [x] `msiexec /x` cleanly uninstalls, no leftover files in `Program Files`. *(covered by the same workflow step.)*
 - [x] Installer size < 50 MB. *(NeuroGraph-1.0.0.msi = 1.5 MB.)*
-- [ ] SmartScreen prompt says "Publisher: NeuroGraph Inc." — depends on cert procurement; `sign.ps1` is wired up and `release-windows.yml` enforces a valid signature on tag builds.
+- [ ] SmartScreen prompt names the publisher on the signing certificate — depends on cert procurement; `sign.ps1` is wired up and `release-windows.yml` enforces a valid signature on tag builds.
 - [~] Upgrades: installing v1.0.1 over v1.0.0 preserves user license key (P1-11) and trained models. *(MajorUpgrade scheduled afterInstallInitialize; `tests/manual/vm_smoke.md` Section 5 ("Upgrade leg") covers the rehearsal checklist (revert pristine → install previous MSI → seed license + saved bundle → install new MSI on top → verify license + bundle persisted, single ARP entry). Actual rehearsal still required per major release once a real previous-release MSI is published.)*
 - [~] Tested on clean Windows 10 22H2 VM and Windows 11. *(`tests/manual/vm_smoke.md` covers both images explicitly with per-VM provisioning, install, wizard end-to-end, predict CLI, license flow, upgrade leg, and uninstall sections. Actual rehearsal run still pending per release; release-windows.yml runs on windows-2022 GH-hosted but that's not a clean-image rehearsal.)*
 
