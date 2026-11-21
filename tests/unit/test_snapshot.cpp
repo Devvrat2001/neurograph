@@ -56,18 +56,26 @@ static snapshot::SnapshotMetadata make_test_metadata(const std::string& name = "
     return meta;
 }
 
-// Temp directory helper
+// Each test gets its own folder. CTest runs every test as a separate
+// process, several at once, and with one folder for the whole fixture a
+// test's TearDown deleted files that another test was still using.
 class SnapshotTestFixture : public ::testing::Test {
 protected:
     std::string test_dir;
 
     void SetUp() override {
-        test_dir = (fs::temp_directory_path() / "neurograph_test_snapshots").string();
-        fs::create_directories(test_dir);
+        const auto& info = *::testing::UnitTest::GetInstance()->current_test_info();
+        const auto dir = fs::temp_directory_path() / "neurograph_test_snapshots"
+                         / info.test_suite_name() / info.name();
+        std::error_code ec;
+        fs::remove_all(dir, ec);  // left over from an interrupted run
+        fs::create_directories(dir);
+        test_dir = dir.string();
     }
 
     void TearDown() override {
-        fs::remove_all(test_dir);
+        std::error_code ec;
+        fs::remove_all(test_dir, ec);
     }
 };
 
