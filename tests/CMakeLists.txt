@@ -96,37 +96,43 @@ gtest_discover_tests(neurograph_tests)
 #
 # Build dep on neurograph_predict matches the unit-test target — the
 # predict-binary perf test shells out to the built exe.
+#
+# NEUROGRAPH_BUILD_PERF=OFF leaves the target out altogether. A build
+# that defines the target but does not build it makes CTest register a
+# placeholder test, neurograph_perf_NOT_BUILT, that always fails.
 # ---------------------------------------------------------------------------
-add_executable(neurograph_perf
-    perf/test_perf_classification_metrics.cpp
-    perf/test_perf_predict_binary.cpp
-    perf/test_perf_auto_pipeline.cpp
-    perf/test_perf_binary_size.cpp
-    # P1-09 AC2: headless ImGui frame-time bench over the wizard
-    # screens in neurograph_workbench_ui.
-    perf/test_perf_wizard_render.cpp
-    ${NEUROGRAPH_CUDA_LINK_STUB}
-)
+if(NEUROGRAPH_BUILD_PERF)
+    add_executable(neurograph_perf
+        perf/test_perf_classification_metrics.cpp
+        perf/test_perf_predict_binary.cpp
+        perf/test_perf_auto_pipeline.cpp
+        perf/test_perf_binary_size.cpp
+        # P1-09 AC2: headless ImGui frame-time bench over the wizard
+        # screens in neurograph_workbench_ui.
+        perf/test_perf_wizard_render.cpp
+        ${NEUROGRAPH_CUDA_LINK_STUB}
+    )
 
-target_link_libraries(neurograph_perf PRIVATE
-    neurograph_lib
-    neurograph_workbench_ui
-    GTest::gtest_main
-)
+    target_link_libraries(neurograph_perf PRIVATE
+        neurograph_lib
+        neurograph_workbench_ui
+        GTest::gtest_main
+    )
 
-add_dependencies(neurograph_perf neurograph_predict)
-target_compile_definitions(neurograph_perf PRIVATE
-    NEUROGRAPH_PREDICT_EXE="$<TARGET_FILE:neurograph_predict>"
-)
+    add_dependencies(neurograph_perf neurograph_predict)
+    target_compile_definitions(neurograph_perf PRIVATE
+        NEUROGRAPH_PREDICT_EXE="$<TARGET_FILE:neurograph_predict>"
+    )
 
-set_target_properties(neurograph_perf PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-    CUDA_RESOLVE_DEVICE_SYMBOLS ON
-)
+    set_target_properties(neurograph_perf PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    )
 
-neurograph_attach_asan_runtime(neurograph_perf)
-neurograph_copy_runtime_dlls(neurograph_perf)
+    neurograph_attach_asan_runtime(neurograph_perf)
+    neurograph_copy_runtime_dlls(neurograph_perf)
 
-gtest_discover_tests(neurograph_perf
-    PROPERTIES LABELS "perf"
-)
+    gtest_discover_tests(neurograph_perf
+        PROPERTIES LABELS "perf"
+    )
+endif()
