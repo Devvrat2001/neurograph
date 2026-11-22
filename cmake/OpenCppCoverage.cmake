@@ -88,12 +88,19 @@ function(add_coverage_run name)
     # (vcpkg, system headers, GoogleTest) is treated as ignored cover
     # rather than missing cover, which is exactly what we want — we're
     # gating on *our* code's coverage, not the world's.
+    #
+    # The filters are matched against the paths stored in the PDBs,
+    # which use backslashes, and OpenCppCoverage refuses a filter that
+    # contains '/' or a "." or ".." part. CMake paths use '/', so pass
+    # each one in native form.
     set(_src_args "")
     foreach(_dir IN LISTS COV_SOURCES_DIR)
-        list(APPEND _src_args --sources "${_dir}")
+        cmake_path(NATIVE_PATH _dir NORMALIZE _native_dir)
+        list(APPEND _src_args --sources "${_native_dir}")
     endforeach()
     foreach(_dir IN LISTS COV_EXCLUDE_DIR)
-        list(APPEND _src_args --excluded_sources "${_dir}")
+        cmake_path(NATIVE_PATH _dir NORMALIZE _native_dir)
+        list(APPEND _src_args --excluded_sources "${_native_dir}")
     endforeach()
 
     if(OPENCPPCOVERAGE_EXE)
